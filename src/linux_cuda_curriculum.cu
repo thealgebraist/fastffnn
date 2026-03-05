@@ -196,8 +196,9 @@ int main() {
 
     for(int b_size : candidate_batches) {
         auto b_start = chrono::high_resolution_clock::now();
+        float total_correct = 0;
         for(int i=0; i<5; ++i) {
-            *loss_gpu = 0;
+            *loss_gpu = 0; *correct_gpu = 0;
             for(int b=0; b<b_size; ++b) { batch_indices_gpu[b] = current_subset[gen() % current_subset.size()]; batch_labels[b] = all_labels[batch_indices_gpu[b]]; }
             gather_images_kernel<<<(b_size+255)/256, 256>>>(all_images.data(), batch_indices_gpu, batch_imgs.data(), b_size, INPUT_DIM);
             float alpha = 1.0f, beta = 0.0f;
@@ -206,11 +207,13 @@ int main() {
             cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, NUM_CLASSES, b_size, H, &alpha, W2.data(), NUM_CLASSES, hs.data(), H, &beta, logits.data(), NUM_CLASSES);
             softmax_loss_kernel<<<(b_size+255)/256, 256>>>(logits.data(), b2.data(), batch_labels.data(), dLogits.data(), loss_gpu, correct_gpu, b_size, NUM_CLASSES);
             cudaDeviceSynchronize();
+            total_correct += (float)*correct_gpu;
         }
         auto b_end = chrono::high_resolution_clock::now();
         double elapsed = chrono::duration<double>(b_end - b_start).count();
-        float efficiency = (b_size * 5.0f / elapsed);
-        cout << "[Bench] Batch: " << b_size << " | Efficiency: " << efficiency << " img/s" << endl;
+        // Efficiency = (Total Correct / Total Samples) / Time = Accuracy Reduction per second
+        float efficiency = (total_correct / (b_size * 5.0f)) / elapsed;
+        cout << "[Bench] Batch: " << b_size << " | Efficiency: " << efficiency << " acc_red/s" << endl;
         if(efficiency > best_efficiency) { best_efficiency = efficiency; best_batch = b_size; }
     }
     cout << "Winner: Batch Size " << best_batch << endl;
