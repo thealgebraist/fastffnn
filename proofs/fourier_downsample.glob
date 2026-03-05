@@ -1,0 +1,295 @@
+DIGEST 802e7ae04dc69ffedb43093c7fa42d21
+Ffourier_downsample
+R24:28 Stdlib.Reals.Reals <> <> lib
+R55:58 Stdlib.Lists.List <> <> lib
+R85:88 Stdlib.Bool.Bool <> <> lib
+R115:144 Stdlib.Logic.FunctionalExtensionality <> <> lib
+ax 238:242 <> image
+R249:252 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R246:248 Corelib.Init.Datatypes <> nat ind
+R256:259 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R253:255 Corelib.Init.Datatypes <> nat ind
+R260:260 Stdlib.Reals.Rdefinitions RbaseSymbolsImpl R defax
+ax 273:277 <> dct2d
+R281:281 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R297:301 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R285:288 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R282:284 Corelib.Init.Datatypes <> nat ind
+R292:295 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R289:291 Corelib.Init.Datatypes <> nat ind
+R296:296 Stdlib.Reals.Rdefinitions RbaseSymbolsImpl R defax
+R305:308 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R302:304 Corelib.Init.Datatypes <> nat ind
+R312:315 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R309:311 Corelib.Init.Datatypes <> nat ind
+R316:316 Stdlib.Reals.Rdefinitions RbaseSymbolsImpl R defax
+ax 329:334 <> idct2d
+R338:338 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R354:358 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R342:345 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R339:341 Corelib.Init.Datatypes <> nat ind
+R349:352 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R346:348 Corelib.Init.Datatypes <> nat ind
+R353:353 Stdlib.Reals.Rdefinitions RbaseSymbolsImpl R defax
+R362:365 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R359:361 Corelib.Init.Datatypes <> nat ind
+R369:372 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R366:368 Corelib.Init.Datatypes <> nat ind
+R373:373 Stdlib.Reals.Rdefinitions RbaseSymbolsImpl R defax
+ax 419:428 <> dct_linear
+R449:452 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R446:448 Corelib.Init.Datatypes <> nat ind
+R456:459 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R453:455 Corelib.Init.Datatypes <> nat ind
+R460:460 Stdlib.Reals.Rdefinitions RbaseSymbolsImpl R defax
+binder 440:440 <> f:7
+binder 442:442 <> g:8
+R470:470 Stdlib.Reals.Rdefinitions RbaseSymbolsImpl R defax
+binder 464:464 <> a:9
+binder 466:466 <> b:10
+R476:476 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+R532:538 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+R587:587 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+binder 481:481 <> u:11
+binder 483:483 <> v:12
+R488:492 fourier_downsample <> dct2d defax
+binder 499:499 <> x:13
+binder 501:501 <> y:14
+R515:517 Stdlib.Reals.Rdefinitions <> ::R_scope:x_'+'_x not
+R507:509 Stdlib.Reals.Rdefinitions <> ::R_scope:x_'*'_x not
+R506:506 fourier_downsample <> a:9 var
+R510:510 fourier_downsample <> f:7 var
+R514:514 fourier_downsample <> y:14 var
+R512:512 fourier_downsample <> x:13 var
+R519:521 Stdlib.Reals.Rdefinitions <> ::R_scope:x_'*'_x not
+R518:518 fourier_downsample <> b:10 var
+R522:522 fourier_downsample <> g:8 var
+R526:526 fourier_downsample <> y:14 var
+R524:524 fourier_downsample <> x:13 var
+R529:529 fourier_downsample <> u:11 var
+R531:531 fourier_downsample <> v:12 var
+binder 543:543 <> u:15
+binder 545:545 <> v:16
+R567:569 Stdlib.Reals.Rdefinitions <> ::R_scope:x_'+'_x not
+R551:554 Stdlib.Reals.Rdefinitions <> ::R_scope:x_'*'_x not
+R566:566 Stdlib.Reals.Rdefinitions <> ::R_scope:x_'*'_x not
+R550:550 fourier_downsample <> a:9 var
+R555:559 fourier_downsample <> dct2d defax
+R561:561 fourier_downsample <> f:7 var
+R563:563 fourier_downsample <> u:15 var
+R565:565 fourier_downsample <> v:16 var
+R571:574 Stdlib.Reals.Rdefinitions <> ::R_scope:x_'*'_x not
+R586:586 Stdlib.Reals.Rdefinitions <> ::R_scope:x_'*'_x not
+R570:570 fourier_downsample <> b:10 var
+R575:579 fourier_downsample <> dct2d defax
+R581:581 fourier_downsample <> g:8 var
+R583:583 fourier_downsample <> u:15 var
+R585:585 fourier_downsample <> v:16 var
+ax 597:607 <> idct_linear
+R628:631 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R625:627 Corelib.Init.Datatypes <> nat ind
+R635:638 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R632:634 Corelib.Init.Datatypes <> nat ind
+R639:639 Stdlib.Reals.Rdefinitions RbaseSymbolsImpl R defax
+binder 619:619 <> f:19
+binder 621:621 <> g:20
+R649:649 Stdlib.Reals.Rdefinitions RbaseSymbolsImpl R defax
+binder 643:643 <> a:21
+binder 645:645 <> b:22
+R655:655 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+R712:718 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+R769:769 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+binder 660:660 <> x:23
+binder 662:662 <> y:24
+R667:672 fourier_downsample <> idct2d defax
+binder 679:679 <> u:25
+binder 681:681 <> v:26
+R695:697 Stdlib.Reals.Rdefinitions <> ::R_scope:x_'+'_x not
+R687:689 Stdlib.Reals.Rdefinitions <> ::R_scope:x_'*'_x not
+R686:686 fourier_downsample <> a:21 var
+R690:690 fourier_downsample <> f:19 var
+R694:694 fourier_downsample <> v:26 var
+R692:692 fourier_downsample <> u:25 var
+R699:701 Stdlib.Reals.Rdefinitions <> ::R_scope:x_'*'_x not
+R698:698 fourier_downsample <> b:22 var
+R702:702 fourier_downsample <> g:20 var
+R706:706 fourier_downsample <> v:26 var
+R704:704 fourier_downsample <> u:25 var
+R709:709 fourier_downsample <> x:23 var
+R711:711 fourier_downsample <> y:24 var
+binder 723:723 <> x:27
+binder 725:725 <> y:28
+R748:750 Stdlib.Reals.Rdefinitions <> ::R_scope:x_'+'_x not
+R731:734 Stdlib.Reals.Rdefinitions <> ::R_scope:x_'*'_x not
+R747:747 Stdlib.Reals.Rdefinitions <> ::R_scope:x_'*'_x not
+R730:730 fourier_downsample <> a:21 var
+R735:740 fourier_downsample <> idct2d defax
+R742:742 fourier_downsample <> f:19 var
+R744:744 fourier_downsample <> x:27 var
+R746:746 fourier_downsample <> y:28 var
+R752:755 Stdlib.Reals.Rdefinitions <> ::R_scope:x_'*'_x not
+R768:768 Stdlib.Reals.Rdefinitions <> ::R_scope:x_'*'_x not
+R751:751 fourier_downsample <> b:22 var
+R756:761 fourier_downsample <> idct2d defax
+R763:763 fourier_downsample <> g:20 var
+R765:765 fourier_downsample <> x:27 var
+R767:767 fourier_downsample <> y:28 var
+def 855:864 <> fourier_op
+R876:879 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R873:875 Corelib.Init.Datatypes <> nat ind
+R883:886 Corelib.Init.Logic <> ::type_scope:x_'->'_x not
+R880:882 Corelib.Init.Datatypes <> nat ind
+R887:887 Stdlib.Reals.Rdefinitions RbaseSymbolsImpl R defax
+binder 867:869 <> img:31
+R899:901 Corelib.Init.Datatypes <> nat ind
+binder 891:891 <> k:32
+binder 893:893 <> x:33
+binder 895:895 <> y:34
+R906:906 Stdlib.Reals.Rdefinitions RbaseSymbolsImpl R defax
+R913:918 fourier_downsample <> idct2d defax
+binder 925:925 <> u:35
+binder 927:927 <> v:36
+R936:939 Corelib.Init.Datatypes <> andb def
+R956:962 Stdlib.Arith.PeanoNat Nat ltb def
+R964:964 fourier_downsample <> v:36 var
+R966:966 fourier_downsample <> k:32 var
+R942:948 Stdlib.Arith.PeanoNat Nat ltb def
+R950:950 fourier_downsample <> u:35 var
+R952:952 fourier_downsample <> k:32 var
+R975:979 fourier_downsample <> dct2d defax
+R981:983 fourier_downsample <> img:31 var
+R985:985 fourier_downsample <> u:35 var
+R987:987 fourier_downsample <> v:36 var
+R999:999 fourier_downsample <> x:33 var
+R1001:1001 fourier_downsample <> y:34 var
+prf 1070:1089 <> downsample_is_linear
+binder 1100:1100 <> k:37
+binder 1102:1102 <> x:38
+binder 1104:1104 <> y:39
+binder 1106:1106 <> f:40
+binder 1108:1108 <> g:41
+binder 1110:1110 <> a:42
+binder 1112:1112 <> b:43
+R1168:1172 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+R1117:1126 fourier_downsample <> fourier_op def
+binder 1133:1133 <> i:44
+binder 1135:1135 <> j:45
+R1149:1151 Stdlib.Reals.Rdefinitions <> ::R_scope:x_'+'_x not
+R1141:1143 Stdlib.Reals.Rdefinitions <> ::R_scope:x_'*'_x not
+R1140:1140 fourier_downsample <> a:42 var
+R1144:1144 fourier_downsample <> f:40 var
+R1146:1146 fourier_downsample <> i:44 var
+R1148:1148 fourier_downsample <> j:45 var
+R1153:1155 Stdlib.Reals.Rdefinitions <> ::R_scope:x_'*'_x not
+R1152:1152 fourier_downsample <> b:43 var
+R1156:1156 fourier_downsample <> g:41 var
+R1158:1158 fourier_downsample <> i:44 var
+R1160:1160 fourier_downsample <> j:45 var
+R1163:1163 fourier_downsample <> k:37 var
+R1165:1165 fourier_downsample <> x:38 var
+R1167:1167 fourier_downsample <> y:39 var
+R1195:1197 Stdlib.Reals.Rdefinitions <> ::R_scope:x_'+'_x not
+R1174:1176 Stdlib.Reals.Rdefinitions <> ::R_scope:x_'*'_x not
+R1173:1173 fourier_downsample <> a:42 var
+R1177:1186 fourier_downsample <> fourier_op def
+R1188:1188 fourier_downsample <> f:40 var
+R1190:1190 fourier_downsample <> k:37 var
+R1192:1192 fourier_downsample <> x:38 var
+R1194:1194 fourier_downsample <> y:39 var
+R1199:1201 Stdlib.Reals.Rdefinitions <> ::R_scope:x_'*'_x not
+R1198:1198 fourier_downsample <> b:43 var
+R1202:1211 fourier_downsample <> fourier_op def
+R1213:1213 fourier_downsample <> g:41 var
+R1215:1215 fourier_downsample <> k:37 var
+R1217:1217 fourier_downsample <> x:38 var
+R1219:1219 fourier_downsample <> y:39 var
+R1246:1255 fourier_downsample <> fourier_op def
+R1268:1277 fourier_downsample <> dct_linear prfax
+R1268:1277 fourier_downsample <> dct_linear prfax
+R1268:1277 fourier_downsample <> dct_linear prfax
+R1293:1293 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+R1388:1405 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+R1579:1579 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+binder 1298:1298 <> u:46
+binder 1300:1300 <> v:47
+R1308:1311 Corelib.Init.Datatypes <> andb def
+R1328:1334 Stdlib.Arith.PeanoNat Nat ltb def
+R1336:1336 fourier_downsample <> v:47 var
+R1314:1320 Stdlib.Arith.PeanoNat Nat ltb def
+R1322:1322 fourier_downsample <> u:46 var
+R1361:1363 Stdlib.Reals.Rdefinitions <> ::R_scope:x_'+'_x not
+R1347:1349 Stdlib.Reals.Rdefinitions <> ::R_scope:x_'*'_x not
+R1350:1354 fourier_downsample <> dct2d defax
+R1358:1358 fourier_downsample <> u:46 var
+R1360:1360 fourier_downsample <> v:47 var
+R1365:1367 Stdlib.Reals.Rdefinitions <> ::R_scope:x_'*'_x not
+R1368:1372 fourier_downsample <> dct2d defax
+R1376:1376 fourier_downsample <> u:46 var
+R1378:1378 fourier_downsample <> v:47 var
+binder 1410:1410 <> u:48
+binder 1412:1412 <> v:49
+R1484:1511 Stdlib.Reals.Rdefinitions <> ::R_scope:x_'+'_x not
+R1418:1421 Stdlib.Reals.Rdefinitions <> ::R_scope:x_'*'_x not
+R1483:1483 Stdlib.Reals.Rdefinitions <> ::R_scope:x_'*'_x not
+R1425:1428 Corelib.Init.Datatypes <> andb def
+R1445:1451 Stdlib.Arith.PeanoNat Nat ltb def
+R1453:1453 fourier_downsample <> v:49 var
+R1431:1437 Stdlib.Arith.PeanoNat Nat ltb def
+R1439:1439 fourier_downsample <> u:48 var
+R1463:1467 fourier_downsample <> dct2d defax
+R1471:1471 fourier_downsample <> u:48 var
+R1473:1473 fourier_downsample <> v:49 var
+R1513:1516 Stdlib.Reals.Rdefinitions <> ::R_scope:x_'*'_x not
+R1578:1578 Stdlib.Reals.Rdefinitions <> ::R_scope:x_'*'_x not
+R1520:1523 Corelib.Init.Datatypes <> andb def
+R1540:1546 Stdlib.Arith.PeanoNat Nat ltb def
+R1548:1548 fourier_downsample <> v:49 var
+R1526:1532 Stdlib.Arith.PeanoNat Nat ltb def
+R1534:1534 fourier_downsample <> u:48 var
+R1558:1562 fourier_downsample <> dct2d defax
+R1566:1566 fourier_downsample <> u:48 var
+R1568:1568 fourier_downsample <> v:49 var
+R1293:1293 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+R1388:1405 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+R1579:1579 Corelib.Init.Logic <> ::type_scope:x_'='_x not
+binder 1298:1298 <> u:50
+binder 1300:1300 <> v:51
+R1308:1311 Corelib.Init.Datatypes <> andb def
+R1328:1334 Stdlib.Arith.PeanoNat Nat ltb def
+R1336:1336 fourier_downsample <> v:51 var
+R1314:1320 Stdlib.Arith.PeanoNat Nat ltb def
+R1322:1322 fourier_downsample <> u:50 var
+R1361:1363 Stdlib.Reals.Rdefinitions <> ::R_scope:x_'+'_x not
+R1347:1349 Stdlib.Reals.Rdefinitions <> ::R_scope:x_'*'_x not
+R1350:1354 fourier_downsample <> dct2d defax
+R1358:1358 fourier_downsample <> u:50 var
+R1360:1360 fourier_downsample <> v:51 var
+R1365:1367 Stdlib.Reals.Rdefinitions <> ::R_scope:x_'*'_x not
+R1368:1372 fourier_downsample <> dct2d defax
+R1376:1376 fourier_downsample <> u:50 var
+R1378:1378 fourier_downsample <> v:51 var
+binder 1410:1410 <> u:52
+binder 1412:1412 <> v:53
+R1484:1511 Stdlib.Reals.Rdefinitions <> ::R_scope:x_'+'_x not
+R1418:1421 Stdlib.Reals.Rdefinitions <> ::R_scope:x_'*'_x not
+R1483:1483 Stdlib.Reals.Rdefinitions <> ::R_scope:x_'*'_x not
+R1425:1428 Corelib.Init.Datatypes <> andb def
+R1445:1451 Stdlib.Arith.PeanoNat Nat ltb def
+R1453:1453 fourier_downsample <> v:53 var
+R1431:1437 Stdlib.Arith.PeanoNat Nat ltb def
+R1439:1439 fourier_downsample <> u:52 var
+R1463:1467 fourier_downsample <> dct2d defax
+R1471:1471 fourier_downsample <> u:52 var
+R1473:1473 fourier_downsample <> v:53 var
+R1513:1516 Stdlib.Reals.Rdefinitions <> ::R_scope:x_'*'_x not
+R1578:1578 Stdlib.Reals.Rdefinitions <> ::R_scope:x_'*'_x not
+R1520:1523 Corelib.Init.Datatypes <> andb def
+R1540:1546 Stdlib.Arith.PeanoNat Nat ltb def
+R1548:1548 fourier_downsample <> v:53 var
+R1526:1532 Stdlib.Arith.PeanoNat Nat ltb def
+R1534:1534 fourier_downsample <> u:52 var
+R1558:1562 fourier_downsample <> dct2d defax
+R1566:1566 fourier_downsample <> u:52 var
+R1568:1568 fourier_downsample <> v:53 var
+R1593:1617 Stdlib.Logic.FunctionalExtensionality <> functional_extensionality thm
+R1593:1617 Stdlib.Logic.FunctionalExtensionality <> functional_extensionality thm
