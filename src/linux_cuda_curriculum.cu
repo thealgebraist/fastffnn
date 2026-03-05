@@ -45,11 +45,11 @@ using CudaVector = std::vector<float, CudaManagedAllocator<float>>;
 
 const int IMG_SIZE = 32;
 const int INPUT_DIM = 3072;
-const int MAX_NEURONS = 4096;
+const int MAX_NEURONS = 8192;
 const int NUM_CLASSES = 10;
 const int TRAIN_LIMIT_S = 600; 
 const int INITIAL_IMAGES = 8192;
-const int INITIAL_NEURONS = 256;
+const int INITIAL_NEURONS = 1024;
 const int MAX_BENCH_BATCH = 65536;
 const float CLIP_THRESHOLD = 5.0f;
 
