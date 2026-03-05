@@ -237,11 +237,21 @@ int main() {
         bn_backprop_kernel<<<(H+255)/256, 256>>>(dL_dhs.data(), hs_norm.data(), bn_gamma.data(), bn_beta.data(), var.data(), db1.data(), dG.data(), dB.data(), dh_scaled.data(), H, best_batch);
         CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, H, INPUT_DIM, best_batch, &alpha, dh_scaled.data(), H, batch_imgs.data(), INPUT_DIM, &beta, dW1.data(), MAX_NEURONS));
         
+        float inv_B = 1.0f / best_batch;
+        scale_vec_kernel<<<(dW1.size()+255)/256, 256>>>(dW1.data(), inv_B, dW1.size());
+        scale_vec_kernel<<<(MAX_NEURONS+255)/256, 256>>>(db1.data(), inv_B, H);
+        scale_vec_kernel<<<(dW2.size()+255)/256, 256>>>(dW2.data(), inv_B, dW2.size());
+        scale_vec_kernel<<<(NUM_CLASSES+255)/256, 256>>>(db2.data(), inv_B, NUM_CLASSES);
+        scale_vec_kernel<<<(MAX_NEURONS+255)/256, 256>>>(dG.data(), inv_B, H);
+        scale_vec_kernel<<<(MAX_NEURONS+255)/256, 256>>>(dB.data(), inv_B, H);
+        cudaDeviceSynchronize();
+
         float n1, n2, n3, n4, n5, n6;
         cublasSnrm2(handle, dW1.size(), dW1.data(), 1, &n1); cublasSnrm2(handle, H, db1.data(), 1, &n2);
         cublasSnrm2(handle, dW2.size(), dW2.data(), 1, &n3); cublasSnrm2(handle, NUM_CLASSES, db2.data(), 1, &n4);
         cublasSnrm2(handle, H, dG.data(), 1, &n5); cublasSnrm2(handle, H, dB.data(), 1, &n6);
         float total_norm = sqrtf(n1*n1 + n2*n2 + n3*n3 + n4*n4 + n5*n5 + n6*n6);
+        
         if(total_norm > CLIP_THRESHOLD) {
             float s = CLIP_THRESHOLD / total_norm;
             scale_vec_kernel<<<(dW1.size()+255)/256, 256>>>(dW1.data(), s, dW1.size());
