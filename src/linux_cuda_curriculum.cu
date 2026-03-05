@@ -50,16 +50,15 @@ const int MAX_NEURONS = 4096;
 const int NUM_CLASSES = 10;
 const int TRAIN_LIMIT_S = 600; 
 const int INITIAL_IMAGES = 8192;
-const int INITIAL_NEURONS = 64;
+const int INITIAL_NEURONS = 256;
 const int MAX_BENCH_BATCH = 65536;
+const float CLIP_THRESHOLD = 1.0f;
 
 __global__ void gather_images_kernel(const float* all_images, const int* batch_indices, float* batch_imgs, int B, int D) {
     int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b < B) {
         int idx = batch_indices[b];
-        for(int d=0; d<D; ++d) {
-            batch_imgs[b * D + d] = all_images[idx * D + d];
-        }
+        for(int d=0; d<D; ++d) { batch_imgs[b * D + d] = all_images[idx * D + d]; }
     }
 }
 
@@ -140,6 +139,11 @@ __global__ void bn_backprop_kernel(const float* dL_dhs, const float* h_norm, con
     }
 }
 
+__global__ void scale_vec_kernel(float* v, float s, int size) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) v[i] *= s;
+}
+
 void radam_call(float* w, float* m, float* v, const float* g, int t, float lr, int size) {
     if (size <= 0) return;
     const float b1 = 0.9f, b2 = 0.999f, eps = 1e-8f;
@@ -167,7 +171,7 @@ bool load_cifar(const string& path, CudaVector& images, vector<uint8_t, CudaMana
 }
 
 int main() {
-    cout << "Startup: Massive Power-Scaling Benchmark (Max Batch: 65536)..." << endl;
+    cout << "Advanced CUDA Training (Start Neurons: 256, Dynamic Clipping)..." << endl;
     download_cifar10();
     CudaVector all_images; vector<uint8_t, CudaManagedAllocator<uint8_t>> all_labels;
     for(int i=1; i<=5; ++i) load_cifar("cifar-10-batches-bin/data_batch_" + to_string(i) + ".bin", all_images, all_labels);
@@ -214,10 +218,8 @@ int main() {
     }
     cout << "Winner: Batch Size " << best_batch << endl;
 
-    auto start_time = chrono::high_resolution_clock::now();
-    auto last_print_time = start_time;
-    float lr = 0.001f, last_loss = 1e10;
-    int stagnate_count = 0, t = 0, next_idx = INITIAL_IMAGES;
+    auto start_time = chrono::high_resolution_clock::now(); auto last_print_time = start_time;
+    float lr = 0.001f, last_loss = 1e10; int stagnate_count = 0, t = 0, next_idx = INITIAL_IMAGES;
     CudaVector dW1(MAX_NEURONS * INPUT_DIM), db1(MAX_NEURONS), dW2(NUM_CLASSES * MAX_NEURONS), db2(NUM_CLASSES), dG(MAX_NEURONS), dB(MAX_NEURONS);
 
     while (chrono::duration_cast<chrono::seconds>(chrono::high_resolution_clock::now() - start_time).count() < TRAIN_LIMIT_S) {
@@ -237,6 +239,23 @@ int main() {
         CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, H, best_batch, NUM_CLASSES, &alpha, W2.data(), NUM_CLASSES, dLogits.data(), NUM_CLASSES, &beta, dL_dhs.data(), H));
         bn_backprop_kernel<<<(H+255)/256, 256>>>(dL_dhs.data(), hs_norm.data(), bn_gamma.data(), bn_beta.data(), var.data(), db1.data(), dG.data(), dB.data(), dh_scaled.data(), H, best_batch);
         CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, H, INPUT_DIM, best_batch, &alpha, dh_scaled.data(), H, batch_imgs.data(), INPUT_DIM, &beta, dW1.data(), MAX_NEURONS));
+        
+        // DYNAMIC CLIPPING
+        float gn1, gn2, gn3, gn4, gn5, gn6;
+        cublasSnrm2(handle, dW1.size(), dW1.data(), 1, &gn1); cublasSnrm2(handle, H, db1.data(), 1, &gn2);
+        cublasSnrm2(handle, dW2.size(), dW2.data(), 1, &gn3); cublasSnrm2(handle, NUM_CLASSES, db2.data(), 1, &gn4);
+        cublasSnrm2(handle, H, dG.data(), 1, &gn5); cublasSnrm2(handle, H, dB.data(), 1, &gn6);
+        float total_norm = sqrtf(gn1*gn1 + gn2*gn2 + gn3*gn3 + gn4*gn4 + gn5*gn5 + gn6*gn6);
+        if(total_norm > CLIP_THRESHOLD) {
+            float s = CLIP_THRESHOLD / total_norm;
+            scale_vec_kernel<<<(dW1.size()+255)/256, 256>>>(dW1.data(), s, dW1.size());
+            scale_vec_kernel<<<(MAX_NEURONS+255)/256, 256>>>(db1.data(), s, H);
+            scale_vec_kernel<<<(dW2.size()+255)/256, 256>>>(dW2.data(), s, dW2.size());
+            scale_vec_kernel<<<(NUM_CLASSES+255)/256, 256>>>(db2.data(), s, NUM_CLASSES);
+            scale_vec_kernel<<<(MAX_NEURONS+255)/256, 256>>>(dG.data(), s, H);
+            scale_vec_kernel<<<(MAX_NEURONS+255)/256, 256>>>(dB.data(), s, H);
+        }
+
         float avg_loss = *loss_gpu / best_batch; t++;
         radam_call(W1.data(), mW1.data(), vW1.data(), dW1.data(), t, lr, H * INPUT_DIM);
         radam_call(b1.data(), mb1.data(), vb1.data(), db1.data(), t, lr, H);
@@ -246,13 +265,13 @@ int main() {
         radam_call(bn_beta.data(), mB.data(), vB.data(), dB.data(), t, lr, H);
         cudaDeviceSynchronize();
         if (chrono::duration_cast<chrono::seconds>(chrono::high_resolution_clock::now() - last_print_time).count() >= 1) {
-            cout << "[Time: " << (int)chrono::duration_cast<chrono::seconds>(chrono::high_resolution_clock::now() - start_time).count() << "s] Err: " << (1.0f - (*correct_gpu / (float)best_batch)) * 100.0f << "% | Loss: " << avg_loss << " | Subset: " << current_subset.size() << " | Neurons: " << H << endl;
+            cout << "[Time: " << (int)chrono::duration_cast<chrono::seconds>(chrono::high_resolution_clock::now() - start_time).count() << "s] Err: " << (1.0f - (*correct_gpu / (float)best_batch)) * 100.0f << "% | Loss: " << avg_loss << " | Norm: " << total_norm << " | Neurons: " << H << endl;
             last_print_time = chrono::high_resolution_clock::now();
         }
         if (abs(avg_loss - last_loss) < 1e-4) stagnate_count++; else stagnate_count = 0;
         last_loss = avg_loss;
         if (stagnate_count >= 4) { H += 2; stagnate_count = 0; }
-        if (avg_loss < 0.05 && t % 20 == 0) for(int i=0; i<128 && next_idx < indices.size(); ++i) current_subset.push_back(indices[next_idx++]);
+        if (avg_loss < 0.05 && t % 50 == 0) for(int i=0; i<128 && next_idx < indices.size(); ++i) current_subset.push_back(indices[next_idx++]);
     }
     cublasDestroy(handle); return 0;
 }
