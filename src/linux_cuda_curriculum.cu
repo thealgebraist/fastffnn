@@ -49,11 +49,16 @@ const int NUM_CLASSES = 10;
 const int TRAIN_LIMIT_S = 600; 
 const int INITIAL_NEURONS = 512;
 const int MAX_SAMPLES = 50000;
-const float TARGET_REDUCTION = 0.1f;
+const int BATCH_SIZE = 4096;
+const int BLOCK_SIZE = 16;
+const int NUM_BLOCKS = 1024;
 
-__global__ void update_weights_kernel(float* w, const float* dw, float adaptive_lr, int size) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < size) w[i] -= adaptive_lr * dw[i];
+__global__ void gather_images_kernel(const float* all_images, const int* batch_indices, float* batch_imgs, int B, int D) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b < B) {
+        int idx = batch_indices[b];
+        for(int d=0; d<D; ++d) { batch_imgs[b * D + d] = all_images[idx * D + d]; }
+    }
 }
 
 __global__ void bn_lrelu_forward_kernel(float* hs, float* hs_norm, const float* b1, const float* gamma, const float* beta, float* mu, float* var, int H, int B) {
@@ -92,30 +97,76 @@ __global__ void softmax_loss_kernel(const float* logits, const float* b2, const 
     }
 }
 
-__global__ void bn_backprop_kernel(const float* dL_dhs, const float* h_norm, const float* gamma, const float* beta, const float* var, float* db1, float* dG, float* dB, float* dh_scaled, int H, int B) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < H) {
-        float sum_dl_dy = 0, sum_dl_dy_xhat = 0;
-        for(int b=0; b<B; ++b) {
-            float act = h_norm[b * H + i] * gamma[i] + beta[i];
-            float dL_dact = dL_dhs[b * H + i] * (act > 0 ? 1.0f : 0.1f);
-            float dl_dy = dL_dact * gamma[i];
-            sum_dl_dy += dl_dy; sum_dl_dy_xhat += dl_dy * h_norm[b * H + i];
-            dG[i] += dL_dact * h_norm[b * H + i]; dB[i] += dL_dact;
-        }
-        for(int b=0; b<B; ++b) {
-            float act = h_norm[b * H + i] * gamma[i] + beta[i];
-            float dL_dact = dL_dhs[b * H + i] * (act > 0 ? 1.0f : 0.1f);
-            float dl_dy = dL_dact * gamma[i];
-            float dl_dx = (1.0f / (B * var[i])) * (B * dl_dy - sum_dl_dy - h_norm[b * H + i] * sum_dl_dy_xhat);
-            dh_scaled[b * H + i] = dl_dx; atomicAdd(&db1[i], dl_dx);
-        }
+__global__ void backprop_intermediate_kernel(const float* dLogits, const float* W2, const float* hs_norm, const float* gamma, const float* var, float* dh_scaled, int H, int B, int C) {
+    int b = blockIdx.x;
+    int i = threadIdx.x;
+    if (b < B && i < H) {
+        float dl_dact = 0;
+        for(int c=0; c<C; ++c) dl_dact += dLogits[b * C + c] * W2[c * MAX_NEURONS + i];
+        
+        // Manual ReLU derivative for backprop scaling
+        float act = hs_norm[b * H + i] * gamma[i]; // approximation
+        float dl_dy = dl_dact * (act > 0 ? 1.0f : 0.1f);
+        dh_scaled[b * H + i] = dl_dy / var[i]; // Simplified scale
     }
 }
 
-__global__ void scale_vec_kernel(float* v, float s, int size) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < size) v[i] *= s;
+__global__ void block_newton_kernel(float* W1, float* W2, const int* indices, const float* batch_imgs, const float* hs, const float* hs_norm, const float* dLogits, const float* dh_scaled, float lr, int H, int B) {
+    int block_id = blockIdx.x;
+    __shared__ float H_mat[16][16];
+    __shared__ float g_vec[16];
+    
+    for(int i=0; i<16; ++i) { 
+        if(threadIdx.x == 0) g_vec[i] = 0;
+        for(int j=0; j<16; ++j) if(threadIdx.x == 0) H_mat[i][j] = 0;
+    }
+    __syncthreads();
+
+    // Accumulate Hessian and Gradient across batch
+    for (int b = threadIdx.x; b < B; b += blockDim.x) {
+        float sample_g[16];
+        for (int k = 0; k < 16; ++k) {
+            int idx = indices[block_id * 16 + k];
+            // Only Layer 1 weights for simplicity in this prototype
+            int row = idx / 3072; int col = idx % 3072;
+            sample_g[k] = dh_scaled[b * H + row] * batch_imgs[b * 3072 + col];
+        }
+        for (int i = 0; i < 16; ++i) {
+            atomicAdd(&g_vec[i], sample_g[i]);
+            for (int j = 0; j < 16; ++j) {
+                atomicAdd(&H_mat[i][j], sample_g[i] * sample_g[j]);
+            }
+        }
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        // Solve Hx = -g using simple Gaussian Elimination (16x16)
+        float eps = 1e-4f;
+        for(int i=0; i<16; ++i) H_mat[i][i] += eps; // Damping
+
+        for (int i = 0; i < 16; i++) {
+            int pivot = i;
+            for (int j = i + 1; j < 16; j++) if (fabs(H_mat[j][i]) > fabs(H_mat[pivot][i])) pivot = j;
+            for (int j = i; j < 16; j++) swap(H_mat[i][j], H_mat[pivot][j]);
+            swap(g_vec[i], g_vec[pivot]);
+
+            for (int j = i + 1; j < 16; j++) {
+                float factor = H_mat[j][i] / H_mat[i][i];
+                g_vec[j] -= factor * g_vec[i];
+                for (int k = i; k < 16; k++) H_mat[j][k] -= factor * H_mat[i][k];
+            }
+        }
+        for (int i = 15; i >= 0; i--) {
+            for (int j = i + 1; j < 16; j++) g_vec[i] -= H_mat[i][j] * g_vec[j];
+            g_vec[i] /= H_mat[i][i];
+        }
+        // Update weights: W = W - lr * (H^-1 * g)
+        for (int k = 0; k < 16; k++) {
+            int idx = indices[block_id * 16 + k];
+            W1[idx] -= lr * g_vec[k];
+        }
+    }
 }
 
 void download_cifar10() {
@@ -136,7 +187,7 @@ bool load_cifar(const string& path, CudaVector& images, vector<uint8_t, CudaMana
 }
 
 int main() {
-    cout << "Coq-Verified Variable-Time Solver (Target Reduction: 0.1 per step)..." << endl;
+    cout << "Block-Coordinate Full Newton Solver (16-var blocks) H200 Optimized..." << endl;
     download_cifar10();
     CudaVector all_images; vector<uint8_t, CudaManagedAllocator<uint8_t>> all_labels;
     for(int i=1; i<=5; ++i) load_cifar("cifar-10-batches-bin/data_batch_" + to_string(i) + ".bin", all_images, all_labels);
@@ -150,62 +201,39 @@ int main() {
 
     cublasHandle_t handle; CHECK_CUBLAS(cublasCreate(&handle));
     float* loss_gpu; int* correct_gpu; CHECK_CUDA(cudaMallocManaged(&loss_gpu, sizeof(float))); CHECK_CUDA(cudaMallocManaged(&correct_gpu, sizeof(int)));
-    CudaVector hs(MAX_SAMPLES * MAX_NEURONS), hs_norm(MAX_SAMPLES * MAX_NEURONS), logits(MAX_SAMPLES * NUM_CLASSES), dLogits(MAX_SAMPLES * NUM_CLASSES), dL_dhs(MAX_SAMPLES * MAX_NEURONS), dh_scaled(MAX_SAMPLES * MAX_NEURONS);
+    int* batch_indices_gpu; CHECK_CUDA(cudaMallocManaged(&batch_indices_gpu, BATCH_SIZE * sizeof(int)));
+    int* block_indices_gpu; CHECK_CUDA(cudaMallocManaged(&block_indices_gpu, NUM_BLOCKS * BLOCK_SIZE * sizeof(int)));
+    CudaVector batch_imgs(BATCH_SIZE * INPUT_DIM), hs(BATCH_SIZE * MAX_NEURONS), hs_norm(BATCH_SIZE * MAX_NEURONS), logits(BATCH_SIZE * NUM_CLASSES), dLogits(BATCH_SIZE * NUM_CLASSES), dh_scaled(BATCH_SIZE * MAX_NEURONS);
     CudaVector mu(MAX_NEURONS), var(MAX_NEURONS);
-    
+    vector<uint8_t, CudaManagedAllocator<uint8_t>> batch_labels(BATCH_SIZE);
+
     auto start_time = chrono::high_resolution_clock::now();
-    int last_s = -1; int t = 0;
-    CudaVector dW1(MAX_NEURONS * INPUT_DIM), dW2(NUM_CLASSES * MAX_NEURONS), db1(MAX_NEURONS), db2(NUM_CLASSES), dG(MAX_NEURONS), dB(MAX_NEURONS);
+    int last_s = -1; float lr = 0.5f; int t = 0;
 
     while (chrono::duration_cast<chrono::seconds>(chrono::high_resolution_clock::now() - start_time).count() < TRAIN_LIMIT_S) {
         *loss_gpu = 0; *correct_gpu = 0;
-        cudaMemset(dW1.data(), 0, dW1.size()*4); cudaMemset(dW2.data(), 0, dW2.size()*4);
-        cudaMemset(db1.data(), 0, MAX_NEURONS*4); cudaMemset(db2.data(), 0, NUM_CLASSES*4);
-        cudaMemset(dG.data(), 0, MAX_NEURONS*4); cudaMemset(dB.data(), 0, MAX_NEURONS*4);
-        
+        for(int b=0; b<BATCH_SIZE; ++b) { batch_indices_gpu[b] = gen() % MAX_SAMPLES; batch_labels[b] = all_labels[batch_indices_gpu[b]]; }
+        gather_images_kernel<<<(BATCH_SIZE+255)/256, 256>>>(all_images.data(), batch_indices_gpu, batch_imgs.data(), BATCH_SIZE, INPUT_DIM);
+
         float alpha = 1.0f, beta = 0.0f;
-        CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, H, MAX_SAMPLES, INPUT_DIM, &alpha, W1.data(), MAX_NEURONS, all_images.data(), INPUT_DIM, &beta, hs.data(), H));
-        bn_lrelu_forward_kernel<<<(H+255)/256, 256>>>(hs.data(), hs_norm.data(), b1.data(), bn_gamma.data(), bn_beta.data(), mu.data(), var.data(), H, MAX_SAMPLES);
-        CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, NUM_CLASSES, MAX_SAMPLES, H, &alpha, W2.data(), NUM_CLASSES, hs.data(), H, &beta, logits.data(), NUM_CLASSES));
-        softmax_loss_kernel<<<(MAX_SAMPLES+255)/256, 256>>>(logits.data(), b2.data(), all_labels.data(), dLogits.data(), loss_gpu, correct_gpu, MAX_SAMPLES, NUM_CLASSES);
+        CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, H, BATCH_SIZE, INPUT_DIM, &alpha, W1.data(), MAX_NEURONS, batch_imgs.data(), INPUT_DIM, &beta, hs.data(), H));
+        bn_lrelu_forward_kernel<<<(H+255)/256, 256>>>(hs.data(), hs_norm.data(), b1.data(), bn_gamma.data(), bn_beta.data(), mu.data(), var.data(), H, BATCH_SIZE);
+        CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, NUM_CLASSES, BATCH_SIZE, H, &alpha, W2.data(), NUM_CLASSES, hs.data(), H, &beta, logits.data(), NUM_CLASSES));
+        softmax_loss_kernel<<<(BATCH_SIZE+255)/256, 256>>>(logits.data(), b2.data(), batch_labels.data(), dLogits.data(), loss_gpu, correct_gpu, BATCH_SIZE, NUM_CLASSES);
         cudaDeviceSynchronize();
         
-        CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, NUM_CLASSES, H, MAX_SAMPLES, &alpha, dLogits.data(), NUM_CLASSES, hs.data(), H, &beta, dW2.data(), NUM_CLASSES));
-        CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, H, MAX_SAMPLES, NUM_CLASSES, &alpha, W2.data(), NUM_CLASSES, dLogits.data(), NUM_CLASSES, &beta, dL_dhs.data(), H));
-        bn_backprop_kernel<<<(H+255)/256, 256>>>(dL_dhs.data(), hs_norm.data(), bn_gamma.data(), bn_beta.data(), var.data(), db1.data(), dG.data(), dB.data(), dh_scaled.data(), H, MAX_SAMPLES);
-        CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, H, INPUT_DIM, MAX_SAMPLES, &alpha, dh_scaled.data(), H, all_images.data(), INPUT_DIM, &beta, dW1.data(), MAX_NEURONS));
+        backprop_intermediate_kernel<<<BATCH_SIZE, H>>>(dLogits.data(), W2.data(), hs_norm.data(), bn_gamma.data(), var.data(), dh_scaled.data(), H, BATCH_SIZE, NUM_CLASSES);
         
-        float inv_B = 1.0f / MAX_SAMPLES;
-        scale_vec_kernel<<<(dW1.size()+255)/256, 256>>>(dW1.data(), inv_B, dW1.size());
-        scale_vec_kernel<<<(MAX_NEURONS+255)/256, 256>>>(db1.data(), inv_B, H);
-        scale_vec_kernel<<<(dW2.size()+255)/256, 256>>>(dW2.data(), inv_B, dW2.size());
-        scale_vec_kernel<<<(NUM_CLASSES+255)/256, 256>>>(db2.data(), inv_B, NUM_CLASSES);
-        scale_vec_kernel<<<(MAX_NEURONS+255)/256, 256>>>(dG.data(), inv_B, H);
-        scale_vec_kernel<<<(MAX_NEURONS+255)/256, 256>>>(dB.data(), inv_B, H);
-        cudaDeviceSynchronize();
-
-        // Variable-Time Adaptive Step Logic
-        float n1, n2, n3, n4, n5, n6;
-        cublasSnrm2(handle, dW1.size(), dW1.data(), 1, &n1); cublasSnrm2(handle, H, db1.data(), 1, &n2);
-        cublasSnrm2(handle, dW2.size(), dW2.data(), 1, &n3); cublasSnrm2(handle, NUM_CLASSES, db2.data(), 1, &n4);
-        cublasSnrm2(handle, H, dG.data(), 1, &n5); cublasSnrm2(handle, H, dB.data(), 1, &n6);
-        float total_sq_norm = n1*n1 + n2*n2 + n3*n3 + n4*n4 + n5*n5 + n6*n6;
+        // Randomly pick 1024 blocks of 16 indices from Layer 1 Weights
+        for(int i=0; i < NUM_BLOCKS * BLOCK_SIZE; ++i) block_indices_gpu[i] = gen() % (H * INPUT_DIM);
         
-        // eta = delta / ||g||^2
-        float adaptive_lr = TARGET_REDUCTION / (total_sq_norm + 1e-9f);
-
-        update_weights_kernel<<<(dW1.size()+255)/256, 256>>>(W1.data(), dW1.data(), adaptive_lr, H * INPUT_DIM);
-        update_weights_kernel<<<(MAX_NEURONS+255)/256, 256>>>(db1.data(), dW1.data(), adaptive_lr, H); // reused buffer
-        update_weights_kernel<<<(dW2.size()+255)/256, 256>>>(W2.data(), dW2.data(), adaptive_lr, NUM_CLASSES * MAX_NEURONS);
-        update_weights_kernel<<<(NUM_CLASSES+255)/256, 256>>>(db2.data(), dW2.data(), adaptive_lr, NUM_CLASSES); // reused buffer
-        update_weights_kernel<<<(MAX_NEURONS+255)/256, 256>>>(bn_gamma.data(), dG.data(), adaptive_lr, H);
-        update_weights_kernel<<<(MAX_NEURONS+255)/256, 256>>>(bn_beta.data(), dB.data(), adaptive_lr, H);
+        block_newton_kernel<<<NUM_BLOCKS, 256>>>(W1.data(), W2.data(), block_indices_gpu, batch_imgs.data(), hs.data(), hs_norm.data(), dLogits.data(), dh_scaled.data(), lr, H, BATCH_SIZE);
         
         t++; cudaDeviceSynchronize();
         int current_s = chrono::duration_cast<chrono::seconds>(chrono::high_resolution_clock::now() - start_time).count();
         if (current_s > last_s) {
-            float err = (1.0f - (*correct_gpu / (float)MAX_SAMPLES)) * 100.0f;
-            cout << "[Time: " << current_s << "s] Iter: " << t << " | Err: " << err << "% | adaptive_lr: " << adaptive_lr << endl;
+            float err = (1.0f - (*correct_gpu / (float)BATCH_SIZE)) * 100.0f;
+            cout << "[Time: " << current_s << "s] Iter: " << t << " | Err: " << err << "% | Blocks: " << NUM_BLOCKS << " (16-var each)" << endl;
             last_s = current_s;
         }
     }
