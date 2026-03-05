@@ -44,7 +44,6 @@ struct CudaManagedAllocator {
 using CudaVector = std::vector<float, CudaManagedAllocator<float>>;
 
 const int IMG_SIZE = 32;
-const int CHANNELS = 3;
 const int INPUT_DIM = 3072;
 const int MAX_NEURONS = 4096;
 const int NUM_CLASSES = 10;
@@ -52,7 +51,7 @@ const int TRAIN_LIMIT_S = 600;
 const int INITIAL_IMAGES = 8192;
 const int INITIAL_NEURONS = 256;
 const int MAX_BENCH_BATCH = 65536;
-const float CLIP_THRESHOLD = 1.0f;
+const float CLIP_THRESHOLD = 5.0f;
 
 __global__ void gather_images_kernel(const float* all_images, const int* batch_indices, float* batch_imgs, int B, int D) {
     int b = blockIdx.x * blockDim.x + threadIdx.x;
@@ -76,9 +75,7 @@ __global__ void fused_radam_kernel(float* w, float* m, float* v, const float* g,
             float v_hat = sqrtf(v[i] / (1.0f - b2_t));
             float r_t = sqrtf(((rho_t - 4.0f) * (rho_t - 2.0f) * rho_inf) / ((rho_inf - 4.0f) * (rho_inf - 2.0f) * rho_t));
             w[i] -= lr * r_t * m_hat / (v_hat + eps);
-        } else {
-            w[i] -= lr * m_hat;
-        }
+        } else { w[i] -= lr * m_hat; }
     }
 }
 
@@ -171,7 +168,7 @@ bool load_cifar(const string& path, CudaVector& images, vector<uint8_t, CudaMana
 }
 
 int main() {
-    cout << "Advanced CUDA Training (Start Neurons: 256, Dynamic Clipping)..." << endl;
+    cout << "Massive Throughput H200 Optimized Training..." << endl;
     download_cifar10();
     CudaVector all_images; vector<uint8_t, CudaManagedAllocator<uint8_t>> all_labels;
     for(int i=1; i<=5; ++i) load_cifar("cifar-10-batches-bin/data_batch_" + to_string(i) + ".bin", all_images, all_labels);
@@ -240,12 +237,11 @@ int main() {
         bn_backprop_kernel<<<(H+255)/256, 256>>>(dL_dhs.data(), hs_norm.data(), bn_gamma.data(), bn_beta.data(), var.data(), db1.data(), dG.data(), dB.data(), dh_scaled.data(), H, best_batch);
         CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, H, INPUT_DIM, best_batch, &alpha, dh_scaled.data(), H, batch_imgs.data(), INPUT_DIM, &beta, dW1.data(), MAX_NEURONS));
         
-        // DYNAMIC CLIPPING
-        float gn1, gn2, gn3, gn4, gn5, gn6;
-        cublasSnrm2(handle, dW1.size(), dW1.data(), 1, &gn1); cublasSnrm2(handle, H, db1.data(), 1, &gn2);
-        cublasSnrm2(handle, dW2.size(), dW2.data(), 1, &gn3); cublasSnrm2(handle, NUM_CLASSES, db2.data(), 1, &gn4);
-        cublasSnrm2(handle, H, dG.data(), 1, &gn5); cublasSnrm2(handle, H, dB.data(), 1, &gn6);
-        float total_norm = sqrtf(gn1*gn1 + gn2*gn2 + gn3*gn3 + gn4*gn4 + gn5*gn5 + gn6*gn6);
+        float n1, n2, n3, n4, n5, n6;
+        cublasSnrm2(handle, dW1.size(), dW1.data(), 1, &n1); cublasSnrm2(handle, H, db1.data(), 1, &n2);
+        cublasSnrm2(handle, dW2.size(), dW2.data(), 1, &n3); cublasSnrm2(handle, NUM_CLASSES, db2.data(), 1, &n4);
+        cublasSnrm2(handle, H, dG.data(), 1, &n5); cublasSnrm2(handle, H, dB.data(), 1, &n6);
+        float total_norm = sqrtf(n1*n1 + n2*n2 + n3*n3 + n4*n4 + n5*n5 + n6*n6);
         if(total_norm > CLIP_THRESHOLD) {
             float s = CLIP_THRESHOLD / total_norm;
             scale_vec_kernel<<<(dW1.size()+255)/256, 256>>>(dW1.data(), s, dW1.size());
