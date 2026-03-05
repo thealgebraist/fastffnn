@@ -51,7 +51,7 @@ const int CHANNELS = 3;
 const int INPUT_DIM = IMG_SIZE * IMG_SIZE * CHANNELS;
 const int MAX_NEURONS = 4096;
 const int NUM_CLASSES = 10;
-const int TRAIN_LIMIT_S = 600; // 10 mins
+const int TRAIN_LIMIT_S = 600; 
 const int INITIAL_IMAGES = 8192;
 const int INITIAL_NEURONS = 64;
 const int BATCH_SIZE = 64;
@@ -83,7 +83,6 @@ bool load_cifar(const string& path, CudaVector& images, vector<uint8_t>& labels)
 void mmul(cublasHandle_t handle, const float* A, const float* B, float* C, int M, int N, int K) {
     float alpha = 1.0f;
     float beta = 0.0f;
-    // C^T = B^T * A^T
     CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
                 N, M, K,
                 &alpha,
@@ -152,10 +151,7 @@ void radam_update(CudaVector& w, CudaVector& m, CudaVector& v, const CudaVector&
 
 float l2_dist_sq(const float* a, const float* b) {
     float sum = 0;
-    for(int i=0; i<3072; ++i) {
-        float d = a[i] - b[i];
-        sum += d*d;
-    }
+    for(int i=0; i<3072; ++i) { float d = a[i] - b[i]; sum += d*d; }
     return sum;
 }
 
@@ -190,7 +186,6 @@ struct DynamicNetwork {
         float s1 = sqrtf(2.0f / INPUT_DIM);
         float s2 = 1.0f / end; 
         normal_distribution<float> d1(0, s1), d2(0, s2);
-        
         for(int i = start; i < end; ++i) {
             for(int j = 0; j < INPUT_DIM; ++j) W1[i * INPUT_DIM + j] = d1(gen);
             for(int j = 0; j < NUM_CLASSES; ++j) W2[j * MAX_NEURONS + i] = d2(gen);
@@ -201,14 +196,13 @@ struct DynamicNetwork {
         if (H + count > MAX_NEURONS) return;
         init_neurons(H, H + count);
         H += count;
-        cout << "Dynamic Expansion: Added " << count << " neurons. New width: " << H << endl;
+        cout << "Dynamic Expansion: Added " << count << " neurons. Width: " << H << endl;
     }
 };
 
 int main() {
-    cout << "CUDA BN + Diversity Curriculum Training (600s)..." << endl;
+    cout << "CUDA Intensive Curriculum Training..." << endl;
     download_cifar10();
-    
     CudaVector all_images;
     vector<uint8_t> all_labels;
     for(int i=1; i<=5; ++i) load_cifar("cifar-10-batches-bin/data_batch_" + to_string(i) + ".bin", all_images, all_labels);
@@ -225,9 +219,8 @@ int main() {
     vector<int> current_subset;
     current_subset.push_back(indices[0]);
     for(int i=1; i<INITIAL_IMAGES; ++i) {
-        int best_cand = -1;
-        float max_dist = -1;
-        for(int j=0; j<20; ++j) {
+        int best_cand = -1; float max_dist = -1;
+        for(int j=0; j<10; ++j) {
             int cand = indices[INITIAL_IMAGES + (gen() % (indices.size() - INITIAL_IMAGES))];
             float d = l2_dist_sq(&all_images[current_subset.back() * 3072], &all_images[cand * 3072]);
             if(d > max_dist) { max_dist = d; best_cand = cand; }
@@ -268,21 +261,16 @@ int main() {
         for(int i=0; i<BATCH_SIZE; ++i) batch_indices.push_back(current_subset[gen() % N_sub]);
         
         vector<float> mu(net.H, 0), var(net.H, 0);
-        
-        // Forward
         for (int b = 0; b < BATCH_SIZE; ++b) {
             mmul(handle, net.W1.data(), &all_images[batch_indices[b] * 3072], &hs_buf[b * net.H], net.H, 1, INPUT_DIM);
             CHECK_CUDA(cudaDeviceSynchronize());
-            for(int i=0; i<net.H; ++i) { 
-                hs_buf[b * net.H + i] += net.b1[i]; 
-                mu[i] += hs_buf[b * net.H + i]; 
-            }
+            for(int i=0; i<net.H; ++i) { hs_buf[b * net.H + i] += net.b1[i]; mu[i] += hs_buf[b * net.H + i]; }
         }
         for(int i=0; i<net.H; ++i) mu[i] /= BATCH_SIZE;
         for (int b = 0; b < BATCH_SIZE; ++b) {
             for(int i=0; i<net.H; ++i) {
-                float diff = hs_buf[b * net.H + i] - mu[i];
-                var[i] += diff * diff;
+                float d = hs_buf[b * net.H + i] - mu[i];
+                var[i] += d * d;
             }
         }
         for(int i=0; i<net.H; ++i) var[i] = sqrtf(var[i] / BATCH_SIZE + 1e-5f);
@@ -292,26 +280,19 @@ int main() {
             for(int i=0; i<net.H; ++i) {
                 hs_norm_buf[b * net.H + i] = (hs_buf[b * net.H + i] - mu[i]) / var[i];
                 float act = hs_norm_buf[b * net.H + i] * net.bn_gamma[i] + net.bn_beta[i];
-                hs_buf[b * net.H + i] = act > 0 ? act : 0; // ReLU
+                hs_buf[b * net.H + i] = act > 0 ? act : 0;
             }
-            
             mmul(handle, net.W2.data(), &hs_buf[b * net.H], logits.data(), NUM_CLASSES, 1, net.H);
             CHECK_CUDA(cudaDeviceSynchronize());
-            
             float max_l = -1e10; 
             for(int c=0; c<NUM_CLASSES; ++c) {
-                logits[c] += net.b2[c];
-                if(logits[c] > max_l) max_l = logits[c];
+                logits[c] += net.b2[c]; if(logits[c] > max_l) max_l = logits[c];
             }
             float sum_e = 0; 
-            for(int c=0; c<NUM_CLASSES; ++c) { 
-                logits[c] = expf(logits[c] - max_l); 
-                sum_e += logits[c]; 
-            }
+            for(int c=0; c<NUM_CLASSES; ++c) { logits[c] = expf(logits[c] - max_l); sum_e += logits[c]; }
             int pred = 0;
             for(int c=0; c<NUM_CLASSES; ++c) {
-                logits[c] /= sum_e;
-                if(logits[c] > logits[pred]) pred = c;
+                logits[c] /= sum_e; if(logits[c] > logits[pred]) pred = c;
             }
             if(pred == label) correct++;
             total_loss -= logf(logits[label] + 1e-9f);
@@ -320,7 +301,6 @@ int main() {
                 dLogits[c] = logits[c] - (c == label ? 1.0f : 0.0f);
                 db2[c] += dLogits[c];
             }
-            
             mmul_add(handle, dLogits.data(), &hs_buf[b * net.H], dW2.data(), NUM_CLASSES, net.H, 1);
             CHECK_CUDA(cudaDeviceSynchronize());
             
@@ -331,7 +311,6 @@ int main() {
                     for(int c=0; c<NUM_CLASSES; ++c) dReLU += dLogits[c] * net.W2[c * MAX_NEURONS + i];
                     dG[i] += dReLU * hs_norm_buf[b * net.H + i];
                     dB[i] += dReLU;
-                    
                     float dNorm = dReLU * net.bn_gamma[i];
                     dh_scaled[i] = dNorm / var[i];
                     db1[i] += dh_scaled[i];
@@ -364,4 +343,24 @@ int main() {
 
         int dummy_t = net.t;
         radam_update(net.W1, net.mW1, net.vW1, dW1, dummy_t, lr, net.H * INPUT_DIM);
+        dummy_t = net.t;
         radam_update(net.b1, net.mb1, net.vb1, db1, dummy_t, lr, net.H);
+        dummy_t = net.t;
+        radam_update(net.W2, net.mW2, net.vW2, dW2, dummy_t, lr, NUM_CLASSES * MAX_NEURONS);
+        dummy_t = net.t;
+        radam_update(net.b2, net.mb2, net.vb2, db2, dummy_t, lr, NUM_CLASSES);
+        dummy_t = net.t;
+        radam_update(net.bn_gamma, net.mG, net.vG, dG, dummy_t, lr, net.H);
+        dummy_t = net.t;
+        radam_update(net.bn_beta, net.mB, net.vB, dB, dummy_t, lr, net.H);
+        
+        if (avg_loss < 0.05) {
+            if (net.t % 50 == 0) {
+                cout << "[Curriculum] Adding 128 more images." << endl;
+                for(int i=0; i<128 && next_idx < indices.size(); ++i) current_subset.push_back(indices[next_idx++]);
+            }
+        }
+    }
+    cublasDestroy(handle);
+    return 0;
+}
