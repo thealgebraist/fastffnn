@@ -148,8 +148,14 @@ __global__ void block_newton_kernel(float* W1, float* W2, const int* indices, co
         for (int i = 0; i < 16; i++) {
             int pivot = i;
             for (int j = i + 1; j < 16; j++) if (fabs(H_mat[j][i]) > fabs(H_mat[pivot][i])) pivot = j;
-            for (int j = i; j < 16; j++) swap(H_mat[i][j], H_mat[pivot][j]);
-            swap(g_vec[i], g_vec[pivot]);
+            for (int j = i; j < 16; j++) {
+                float tmp = H_mat[i][j];
+                H_mat[i][j] = H_mat[pivot][j];
+                H_mat[pivot][j] = tmp;
+            }
+            float tmp_g = g_vec[i];
+            g_vec[i] = g_vec[pivot];
+            g_vec[pivot] = tmp_g;
 
             for (int j = i + 1; j < 16; j++) {
                 float factor = H_mat[j][i] / H_mat[i][i];
