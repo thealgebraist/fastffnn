@@ -8,3 +8,6 @@ find_package(CUDAToolkit REQUIRED)
 
 add_executable(cuda_curriculum src/linux_cuda_curriculum.cu)
 target_link_libraries(cuda_curriculum PRIVATE CUDA::cublas CUDA::cusolver)
+
+add_executable(sa_solver src/sa_solver.cu)
+target_link_libraries(sa_solver PRIVATE CUDA::cublas CUDA::curand)
