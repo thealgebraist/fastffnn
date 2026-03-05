@@ -213,6 +213,7 @@ int main() {
     float lr = 0.001f, last_loss = 1e10;
     int stagnate_count = 0, t = 0, next_idx = INITIAL_IMAGES;
     CudaVector dW1(MAX_NEURONS * INPUT_DIM), db1(MAX_NEURONS), dW2(NUM_CLASSES * MAX_NEURONS), db2(NUM_CLASSES), dG(MAX_NEURONS), dB(MAX_NEURONS);
+    vector<uint8_t, CudaManagedAllocator<uint8_t>> batch_labels(16384);
 
     while (chrono::duration_cast<chrono::seconds>(chrono::high_resolution_clock::now() - start_time).count() < TRAIN_LIMIT_S) {
         *loss_gpu = 0; *correct_gpu = 0;
