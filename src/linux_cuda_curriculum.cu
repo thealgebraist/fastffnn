@@ -51,7 +51,7 @@ const int INITIAL_NEURONS = 512;
 const int MAX_SAMPLES = 50000;
 const int BATCH_SIZE = 4096;
 const int BLOCK_SIZE = 128;
-const int NUM_BLOCKS = 128; // 128 blocks * 128 vars = 16384 vars/iter
+const int NUM_BLOCKS = 128;
 
 __global__ void gather_images_kernel(const float* all_images, const int* batch_indices, float* batch_imgs, int B, int D) {
     int b = blockIdx.x * blockDim.x + threadIdx.x;
@@ -111,12 +111,13 @@ __global__ void backprop_intermediate_kernel(const float* dLogits, const float* 
 
 __global__ void block_newton_kernel(float* W1, const int* indices, const float* batch_imgs, float* dh_scaled, float lr, int H, int B) {
     int block_id = blockIdx.x;
-    __shared__ float H_mat[128][128];
-    __shared__ float g_vec[128];
+    extern __shared__ float smem[];
+    float* H_mat = &smem[0];
+    float* g_vec = &smem[128 * 128];
     
     for(int i = threadIdx.x; i < 128; i += blockDim.x) {
         g_vec[i] = 0;
-        for(int j=0; j<128; ++j) H_mat[i][j] = 0;
+        for(int j=0; j<128; ++j) H_mat[i * 128 + j] = 0;
     }
     __syncthreads();
 
@@ -129,11 +130,8 @@ __global__ void block_newton_kernel(float* W1, const int* indices, const float* 
         }
         __syncthreads();
         for (int i = threadIdx.x; i < 128; i += blockDim.x) {
-            float gi = g_vec[i]; // Approximation for shared mem limit
             for (int j = 0; j < 128; ++j) {
-                // Actually need sample-wise g here for true H
-                // Using simplified shared accumulation for performance
-                atomicAdd(&H_mat[i][j], row_g[i] * row_g[j]); 
+                atomicAdd(&H_mat[i * 128 + j], row_g[i] * row_g[j]); 
             }
         }
         __syncthreads();
@@ -141,23 +139,27 @@ __global__ void block_newton_kernel(float* W1, const int* indices, const float* 
 
     if (threadIdx.x == 0) {
         float eps = 1e-3f;
-        for(int i=0; i<128; ++i) H_mat[i][i] += eps;
+        for(int i=0; i<128; ++i) H_mat[i * 128 + i] += eps;
 
         for (int i = 0; i < 128; i++) {
             int pivot = i;
-            for (int j = i + 1; j < 128; j++) if (fabs(H_mat[j][i]) > fabs(H_mat[pivot][i])) pivot = j;
-            for (int j = i; j < 128; j++) { float tmp = H_mat[i][j]; H_mat[i][j] = H_mat[pivot][j]; H_mat[pivot][j] = tmp; }
+            for (int j = i + 1; j < 128; j++) if (fabs(H_mat[j * 128 + i]) > fabs(H_mat[pivot * 128 + i])) pivot = j;
+            for (int j = i; j < 128; j++) { 
+                float tmp = H_mat[i * 128 + j]; 
+                H_mat[i * 128 + j] = H_mat[pivot * 128 + j]; 
+                H_mat[pivot * 128 + j] = tmp; 
+            }
             float tmp_g = g_vec[i]; g_vec[i] = g_vec[pivot]; g_vec[pivot] = tmp_g;
 
             for (int j = i + 1; j < 128; j++) {
-                float factor = H_mat[j][i] / H_mat[i][i];
+                float factor = H_mat[j * 128 + i] / H_mat[i * 128 + i];
                 g_vec[j] -= factor * g_vec[i];
-                for (int k = i; k < 128; k++) H_mat[j][k] -= factor * H_mat[i][k];
+                for (int k = i; k < 128; k++) H_mat[j * 128 + k] -= factor * H_mat[i * 128 + k];
             }
         }
         for (int i = 127; i >= 0; i--) {
-            for (int j = i + 1; j < 128; j++) g_vec[i] -= H_mat[i][j] * g_vec[j];
-            g_vec[i] /= H_mat[i][i];
+            for (int j = i + 1; j < 128; j++) g_vec[i] -= H_mat[i * 128 + j] * g_vec[j];
+            g_vec[i] /= H_mat[i * 128 + i];
         }
         for (int k = 0; k < 128; k++) W1[indices[block_id * 128 + k]] -= lr * g_vec[k];
     }
@@ -181,7 +183,7 @@ bool load_cifar(const string& path, CudaVector& images, vector<uint8_t, CudaMana
 }
 
 int main() {
-    cout << "Newton Solver (Coq-Optimized Block Size: 128) H200 Optimized..." << endl;
+    cout << "Newton Solver (Dynamic SMEM 128-block) H200 Optimized..." << endl;
     download_cifar10();
     CudaVector all_images; vector<uint8_t, CudaManagedAllocator<uint8_t>> all_labels;
     for(int i=1; i<=5; ++i) load_cifar("cifar-10-batches-bin/data_batch_" + to_string(i) + ".bin", all_images, all_labels);
@@ -194,6 +196,11 @@ int main() {
     for(int i=0; i<NUM_CLASSES*MAX_NEURONS; ++i) W2[i] = d2(gen);
 
     cublasHandle_t handle; CHECK_CUBLAS(cublasCreate(&handle));
+    
+    // Set Shared Memory Limit for 128-block (approx 66KB)
+    int smem_size = (128 * 128 + 128) * sizeof(float);
+    CHECK_CUDA(cudaFuncSetAttribute(block_newton_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+
     float* loss_gpu; int* correct_gpu; CHECK_CUDA(cudaMallocManaged(&loss_gpu, sizeof(float))); CHECK_CUDA(cudaMallocManaged(&correct_gpu, sizeof(int)));
     int* batch_indices_gpu; CHECK_CUDA(cudaMallocManaged(&batch_indices_gpu, BATCH_SIZE * sizeof(int)));
     int* block_indices_gpu; CHECK_CUDA(cudaMallocManaged(&block_indices_gpu, NUM_BLOCKS * BLOCK_SIZE * sizeof(int)));
@@ -219,7 +226,7 @@ int main() {
         backprop_intermediate_kernel<<<BATCH_SIZE, H>>>(dLogits.data(), W2.data(), hs_norm.data(), bn_gamma.data(), var.data(), dh_scaled.data(), H, BATCH_SIZE, NUM_CLASSES);
         for(int i=0; i < NUM_BLOCKS * BLOCK_SIZE; ++i) block_indices_gpu[i] = gen() % (H * INPUT_DIM);
         
-        block_newton_kernel<<<NUM_BLOCKS, 256>>>(W1.data(), block_indices_gpu, batch_imgs.data(), dh_scaled.data(), lr, H, BATCH_SIZE);
+        block_newton_kernel<<<NUM_BLOCKS, 256, smem_size>>>(W1.data(), block_indices_gpu, batch_imgs.data(), dh_scaled.data(), lr, H, BATCH_SIZE);
         
         t++; cudaDeviceSynchronize();
         int current_s = chrono::duration_cast<chrono::seconds>(chrono::high_resolution_clock::now() - start_time).count();
