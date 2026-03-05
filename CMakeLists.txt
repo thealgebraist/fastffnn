@@ -11,3 +11,6 @@ target_link_libraries(cuda_curriculum PRIVATE CUDA::cublas CUDA::cusolver)
 
 add_executable(sa_solver src/sa_solver.cu)
 target_link_libraries(sa_solver PRIVATE CUDA::cublas CUDA::curand)
+
+add_executable(mphc_solver src/mphc_solver.cu)
+target_link_libraries(mphc_solver PRIVATE CUDA::cublas CUDA::curand)
