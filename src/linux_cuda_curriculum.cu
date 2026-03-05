@@ -177,7 +177,8 @@ int main() {
     CudaVector hs(FULL_BATCH * MAX_NEURONS), hs_norm(FULL_BATCH * MAX_NEURONS), logits(FULL_BATCH * NUM_CLASSES), dLogits(FULL_BATCH * NUM_CLASSES), dL_dhs(FULL_BATCH * MAX_NEURONS), dh_scaled(FULL_BATCH * MAX_NEURONS);
     CudaVector mu(MAX_NEURONS), var(MAX_NEURONS);
 
-    auto start_time = chrono::high_resolution_clock::now(); auto last_print_time = start_time;
+    auto start_time = chrono::high_resolution_clock::now();
+    int last_s = -1;
     float lr = 0.001f, last_loss = 1e10; int stagnate_count = 0, t = 0;
     CudaVector dW1(MAX_NEURONS * INPUT_DIM), db1(MAX_NEURONS), dW2(NUM_CLASSES * MAX_NEURONS), db2(NUM_CLASSES), dG(MAX_NEURONS), dB(MAX_NEURONS);
 
@@ -230,9 +231,10 @@ int main() {
         radam_call(bn_gamma.data(), mG.data(), vG.data(), dG.data(), t, lr, H);
         radam_call(bn_beta.data(), mB.data(), vB.data(), dB.data(), t, lr, H);
         cudaDeviceSynchronize();
-        if (chrono::duration_cast<chrono::seconds>(chrono::high_resolution_clock::now() - last_print_time).count() >= 1) {
-            cout << "[Time: " << (int)chrono::duration_cast<chrono::seconds>(chrono::high_resolution_clock::now() - start_time).count() << "s] Err: " << (1.0f - (*correct_gpu / (float)FULL_BATCH)) * 100.0f << "% | Loss: " << avg_loss << " | Norm: " << total_norm << " | Neurons: " << H << endl;
-            last_print_time = chrono::high_resolution_clock::now();
+        int current_s = chrono::duration_cast<chrono::seconds>(chrono::high_resolution_clock::now() - start_time).count();
+        if (current_s > last_s) {
+            cout << "[Time: " << current_s << "s] Err: " << (1.0f - (*correct_gpu / (float)FULL_BATCH)) * 100.0f << "% | Loss: " << avg_loss << " | Norm: " << total_norm << " | Neurons: " << H << endl;
+            last_s = current_s;
         }
         if (abs(avg_loss - last_loss) < 1e-4) stagnate_count++; else stagnate_count = 0;
         last_loss = avg_loss;
