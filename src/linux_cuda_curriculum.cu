@@ -50,8 +50,7 @@ const int TRAIN_LIMIT_S = 600;
 const int INITIAL_NEURONS = 512;
 const int MAX_SAMPLES = 50000;
 const int BATCH_SIZE = 4096;
-const int BLOCK_SIZE = 16;
-const int NUM_BLOCKS = 1024;
+const int MAX_B_SIZE = 32;
 
 __global__ void gather_images_kernel(const float* all_images, const int* batch_indices, float* batch_imgs, int B, int D) {
     int b = blockIdx.x * blockDim.x + threadIdx.x;
@@ -103,73 +102,72 @@ __global__ void backprop_intermediate_kernel(const float* dLogits, const float* 
     if (b < B && i < H) {
         float dl_dact = 0;
         for(int c=0; c<C; ++c) dl_dact += dLogits[b * C + c] * W2[c * MAX_NEURONS + i];
-        
-        // Manual ReLU derivative for backprop scaling
-        float act = hs_norm[b * H + i] * gamma[i]; // approximation
+        float act = hs_norm[b * H + i] * gamma[i];
         float dl_dy = dl_dact * (act > 0 ? 1.0f : 0.1f);
-        dh_scaled[b * H + i] = dl_dy / var[i]; // Simplified scale
+        dh_scaled[b * H + i] = dl_dy / var[i];
     }
 }
 
-__global__ void block_newton_kernel(float* W1, float* W2, const int* indices, const float* batch_imgs, const float* hs, const float* hs_norm, const float* dLogits, const float* dh_scaled, float lr, int H, int B) {
+__global__ void block_newton_kernel(float* W1, const int* indices, const float* batch_imgs, float* dh_scaled, float lr, int H, int B, int cur_b_size) {
     int block_id = blockIdx.x;
-    __shared__ float H_mat[16][16];
-    __shared__ float g_vec[16];
+    extern __shared__ float smem[];
+    float* H_mat = &smem[0];
+    float* g_vec = &smem[cur_b_size * cur_b_size];
     
-    for(int i=0; i<16; ++i) { 
-        if(threadIdx.x == 0) g_vec[i] = 0;
-        for(int j=0; j<16; ++j) if(threadIdx.x == 0) H_mat[i][j] = 0;
+    if(threadIdx.x == 0) {
+        for(int i=0; i<cur_b_size; ++i) {
+            g_vec[i] = 0;
+            for(int j=0; j<cur_b_size; ++j) H_mat[i * cur_b_size + j] = 0;
+        }
     }
     __syncthreads();
 
-    // Accumulate Hessian and Gradient across batch
     for (int b = threadIdx.x; b < B; b += blockDim.x) {
-        float sample_g[16];
-        for (int k = 0; k < 16; ++k) {
-            int idx = indices[block_id * 16 + k];
-            // Only Layer 1 weights for simplicity in this prototype
+        float sample_g[32];
+        for (int k = 0; k < cur_b_size; ++k) {
+            int idx = indices[block_id * cur_b_size + k];
             int row = idx / 3072; int col = idx % 3072;
             sample_g[k] = dh_scaled[b * H + row] * batch_imgs[b * 3072 + col];
         }
-        for (int i = 0; i < 16; ++i) {
+        for (int i = 0; i < cur_b_size; ++i) {
             atomicAdd(&g_vec[i], sample_g[i]);
-            for (int j = 0; j < 16; ++j) {
-                atomicAdd(&H_mat[i][j], sample_g[i] * sample_g[j]);
+            for (int j = 0; j < cur_b_size; ++j) {
+                atomicAdd(&H_mat[i * cur_b_size + j], sample_g[i] * sample_g[j]);
             }
         }
     }
     __syncthreads();
 
     if (threadIdx.x == 0) {
-        // Solve Hx = -g using simple Gaussian Elimination (16x16)
         float eps = 1e-4f;
-        for(int i=0; i<16; ++i) H_mat[i][i] += eps; // Damping
+        for(int i=0; i<cur_b_size; ++i) H_mat[i * cur_b_size + i] += eps;
 
-        for (int i = 0; i < 16; i++) {
+        for (int i = 0; i < cur_b_size; i++) {
             int pivot = i;
-            for (int j = i + 1; j < 16; j++) if (fabs(H_mat[j][i]) > fabs(H_mat[pivot][i])) pivot = j;
-            for (int j = i; j < 16; j++) {
-                float tmp = H_mat[i][j];
-                H_mat[i][j] = H_mat[pivot][j];
-                H_mat[pivot][j] = tmp;
+            for (int j = i + 1; j < cur_b_size; j++) 
+                if (fabs(H_mat[j * cur_b_size + i]) > fabs(H_mat[pivot * cur_b_size + i])) pivot = j;
+            
+            for (int j = i; j < cur_b_size; j++) {
+                float tmp = H_mat[i * cur_b_size + j];
+                H_mat[i * cur_b_size + j] = H_mat[pivot * cur_b_size + j];
+                H_mat[pivot * cur_b_size + j] = tmp;
             }
             float tmp_g = g_vec[i];
             g_vec[i] = g_vec[pivot];
             g_vec[pivot] = tmp_g;
 
-            for (int j = i + 1; j < 16; j++) {
-                float factor = H_mat[j][i] / H_mat[i][i];
+            for (int j = i + 1; j < cur_b_size; j++) {
+                float factor = H_mat[j * cur_b_size + i] / H_mat[i * cur_b_size + i];
                 g_vec[j] -= factor * g_vec[i];
-                for (int k = i; k < 16; k++) H_mat[j][k] -= factor * H_mat[i][k];
+                for (int k = i; k < cur_b_size; k++) H_mat[j * cur_b_size + k] -= factor * H_mat[i * cur_b_size + k];
             }
         }
-        for (int i = 15; i >= 0; i--) {
-            for (int j = i + 1; j < 16; j++) g_vec[i] -= H_mat[i][j] * g_vec[j];
-            g_vec[i] /= H_mat[i][i];
+        for (int i = cur_b_size - 1; i >= 0; i--) {
+            for (int j = i + 1; j < cur_b_size; j++) g_vec[i] -= H_mat[i * cur_b_size + j] * g_vec[j];
+            g_vec[i] /= H_mat[i * cur_b_size + i];
         }
-        // Update weights: W = W - lr * (H^-1 * g)
-        for (int k = 0; k < 16; k++) {
-            int idx = indices[block_id * 16 + k];
+        for (int k = 0; k < cur_b_size; k++) {
+            int idx = indices[block_id * cur_b_size + k];
             W1[idx] -= lr * g_vec[k];
         }
     }
@@ -193,7 +191,7 @@ bool load_cifar(const string& path, CudaVector& images, vector<uint8_t, CudaMana
 }
 
 int main() {
-    cout << "Block-Coordinate Full Newton Solver (16-var blocks) H200 Optimized..." << endl;
+    cout << "Newton Block-Size Benchmark Phase (H200)..." << endl;
     download_cifar10();
     CudaVector all_images; vector<uint8_t, CudaManagedAllocator<uint8_t>> all_labels;
     for(int i=1; i<=5; ++i) load_cifar("cifar-10-batches-bin/data_batch_" + to_string(i) + ".bin", all_images, all_labels);
@@ -208,38 +206,65 @@ int main() {
     cublasHandle_t handle; CHECK_CUBLAS(cublasCreate(&handle));
     float* loss_gpu; int* correct_gpu; CHECK_CUDA(cudaMallocManaged(&loss_gpu, sizeof(float))); CHECK_CUDA(cudaMallocManaged(&correct_gpu, sizeof(int)));
     int* batch_indices_gpu; CHECK_CUDA(cudaMallocManaged(&batch_indices_gpu, BATCH_SIZE * sizeof(int)));
-    int* block_indices_gpu; CHECK_CUDA(cudaMallocManaged(&block_indices_gpu, NUM_BLOCKS * BLOCK_SIZE * sizeof(int)));
+    int* block_indices_gpu; CHECK_CUDA(cudaMallocManaged(&block_indices_gpu, 4096 * 64 * sizeof(int))); // Max possible
     CudaVector batch_imgs(BATCH_SIZE * INPUT_DIM), hs(BATCH_SIZE * MAX_NEURONS), hs_norm(BATCH_SIZE * MAX_NEURONS), logits(BATCH_SIZE * NUM_CLASSES), dLogits(BATCH_SIZE * NUM_CLASSES), dh_scaled(BATCH_SIZE * MAX_NEURONS);
     CudaVector mu(MAX_NEURONS), var(MAX_NEURONS);
     vector<uint8_t, CudaManagedAllocator<uint8_t>> batch_labels(BATCH_SIZE);
 
-    auto start_time = chrono::high_resolution_clock::now();
-    int last_s = -1; float lr = 0.5f; int t = 0;
+    vector<int> b_configs = {2, 4, 8, 16, 32};
+    int best_b = 16; float best_eff = -1.0f;
 
+    for (int b_size : b_configs) {
+        auto b_start = chrono::high_resolution_clock::now();
+        float acc_start = 0;
+        for (int i=0; i<5; ++i) {
+            *loss_gpu = 0; *correct_gpu = 0;
+            for(int b=0; b<BATCH_SIZE; ++b) { batch_indices_gpu[b] = gen() % MAX_SAMPLES; batch_labels[b] = all_labels[batch_indices_gpu[b]]; }
+            gather_images_kernel<<<(BATCH_SIZE+255)/256, 256>>>(all_images.data(), batch_indices_gpu, batch_imgs.data(), BATCH_SIZE, INPUT_DIM);
+            float alpha = 1.0f, beta = 0.0f;
+            CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, H, BATCH_SIZE, INPUT_DIM, &alpha, W1.data(), MAX_NEURONS, batch_imgs.data(), INPUT_DIM, &beta, hs.data(), H));
+            bn_lrelu_forward_kernel<<<(H+255)/256, 256>>>(hs.data(), hs_norm.data(), b1.data(), bn_gamma.data(), bn_beta.data(), mu.data(), var.data(), H, BATCH_SIZE);
+            CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, NUM_CLASSES, BATCH_SIZE, H, &alpha, W2.data(), NUM_CLASSES, hs.data(), H, &beta, logits.data(), NUM_CLASSES));
+            softmax_loss_kernel<<<(BATCH_SIZE+255)/256, 256>>>(logits.data(), b2.data(), batch_labels.data(), dLogits.data(), loss_gpu, correct_gpu, BATCH_SIZE, NUM_CLASSES);
+            cudaDeviceSynchronize();
+            if (i==0) acc_start = (*correct_gpu / (float)BATCH_SIZE);
+            backprop_intermediate_kernel<<<BATCH_SIZE, H>>>(dLogits.data(), W2.data(), hs_norm.data(), bn_gamma.data(), var.data(), dh_scaled.data(), H, BATCH_SIZE, NUM_CLASSES);
+            int n_blocks = 16384 / b_size;
+            for(int k=0; k < n_blocks * b_size; ++k) block_indices_gpu[k] = gen() % (H * INPUT_DIM);
+            int smem_size = (b_size * b_size + b_size) * sizeof(float);
+            block_newton_kernel<<<n_blocks, 256, smem_size>>>(W1.data(), block_indices_gpu, batch_imgs.data(), dh_scaled.data(), 0.5f, H, BATCH_SIZE, b_size);
+            cudaDeviceSynchronize();
+        }
+        float acc_end = (*correct_gpu / (float)BATCH_SIZE);
+        double elapsed = chrono::duration<double>(chrono::high_resolution_clock::now() - b_start).count();
+        float eff = (acc_end - acc_start) / elapsed;
+        cout << "[Bench] Block Size: " << b_size << " | Efficiency: " << eff << " ΔAcc/s" << endl;
+        if (eff > best_eff) { best_eff = eff; best_b = b_size; }
+    }
+    cout << "Winner: Block Size " << best_b << endl;
+
+    auto start_time = chrono::high_resolution_clock::now();
+    int last_s = -1; int t = 0;
     while (chrono::duration_cast<chrono::seconds>(chrono::high_resolution_clock::now() - start_time).count() < TRAIN_LIMIT_S) {
         *loss_gpu = 0; *correct_gpu = 0;
         for(int b=0; b<BATCH_SIZE; ++b) { batch_indices_gpu[b] = gen() % MAX_SAMPLES; batch_labels[b] = all_labels[batch_indices_gpu[b]]; }
         gather_images_kernel<<<(BATCH_SIZE+255)/256, 256>>>(all_images.data(), batch_indices_gpu, batch_imgs.data(), BATCH_SIZE, INPUT_DIM);
-
         float alpha = 1.0f, beta = 0.0f;
         CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, H, BATCH_SIZE, INPUT_DIM, &alpha, W1.data(), MAX_NEURONS, batch_imgs.data(), INPUT_DIM, &beta, hs.data(), H));
         bn_lrelu_forward_kernel<<<(H+255)/256, 256>>>(hs.data(), hs_norm.data(), b1.data(), bn_gamma.data(), bn_beta.data(), mu.data(), var.data(), H, BATCH_SIZE);
         CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, NUM_CLASSES, BATCH_SIZE, H, &alpha, W2.data(), NUM_CLASSES, hs.data(), H, &beta, logits.data(), NUM_CLASSES));
         softmax_loss_kernel<<<(BATCH_SIZE+255)/256, 256>>>(logits.data(), b2.data(), batch_labels.data(), dLogits.data(), loss_gpu, correct_gpu, BATCH_SIZE, NUM_CLASSES);
         cudaDeviceSynchronize();
-        
         backprop_intermediate_kernel<<<BATCH_SIZE, H>>>(dLogits.data(), W2.data(), hs_norm.data(), bn_gamma.data(), var.data(), dh_scaled.data(), H, BATCH_SIZE, NUM_CLASSES);
-        
-        // Randomly pick 1024 blocks of 16 indices from Layer 1 Weights
-        for(int i=0; i < NUM_BLOCKS * BLOCK_SIZE; ++i) block_indices_gpu[i] = gen() % (H * INPUT_DIM);
-        
-        block_newton_kernel<<<NUM_BLOCKS, 256>>>(W1.data(), W2.data(), block_indices_gpu, batch_imgs.data(), hs.data(), hs_norm.data(), dLogits.data(), dh_scaled.data(), lr, H, BATCH_SIZE);
-        
+        int n_blocks = 16384 / best_b;
+        for(int k=0; k < n_blocks * best_b; ++k) block_indices_gpu[k] = gen() % (H * INPUT_DIM);
+        int smem_size = (best_b * best_b + best_b) * sizeof(float);
+        block_newton_kernel<<<n_blocks, 256, smem_size>>>(W1.data(), block_indices_gpu, batch_imgs.data(), dh_scaled.data(), 0.5f, H, BATCH_SIZE, best_b);
         t++; cudaDeviceSynchronize();
         int current_s = chrono::duration_cast<chrono::seconds>(chrono::high_resolution_clock::now() - start_time).count();
         if (current_s > last_s) {
             float err = (1.0f - (*correct_gpu / (float)BATCH_SIZE)) * 100.0f;
-            cout << "[Time: " << current_s << "s] Iter: " << t << " | Err: " << err << "% | Blocks: " << NUM_BLOCKS << " (16-var each)" << endl;
+            cout << "[Time: " << current_s << "s] Iter: " << t << " | Err: " << err << "% | Block: " << best_b << endl;
             last_s = current_s;
         }
     }
