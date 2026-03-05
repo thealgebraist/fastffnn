@@ -51,13 +51,15 @@ const int NUM_CLASSES = 10;
 const int TRAIN_LIMIT_S = 600; 
 const int INITIAL_IMAGES = 8192;
 const int INITIAL_NEURONS = 64;
+const int MAX_BENCH_BATCH = 65536;
 
 __global__ void gather_images_kernel(const float* all_images, const int* batch_indices, float* batch_imgs, int B, int D) {
-    int b = blockIdx.x;
-    int d = threadIdx.x;
-    if (b < B && d < D) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b < B) {
         int idx = batch_indices[b];
-        batch_imgs[b * D + d] = all_images[idx * D + d];
+        for(int d=0; d<D; ++d) {
+            batch_imgs[b * D + d] = all_images[idx * D + d];
+        }
     }
 }
 
@@ -165,7 +167,7 @@ bool load_cifar(const string& path, CudaVector& images, vector<uint8_t, CudaMana
 }
 
 int main() {
-    cout << "Startup: High-Utilization CUDA Optimization..." << endl;
+    cout << "Startup: Massive Power-Scaling Benchmark (Max Batch: 65536)..." << endl;
     download_cifar10();
     CudaVector all_images; vector<uint8_t, CudaManagedAllocator<uint8_t>> all_labels;
     for(int i=1; i<=5; ++i) load_cifar("cifar-10-batches-bin/data_batch_" + to_string(i) + ".bin", all_images, all_labels);
@@ -184,19 +186,19 @@ int main() {
     vector<int, CudaManagedAllocator<int>> current_subset(indices.begin(), indices.begin() + INITIAL_IMAGES);
     
     int best_batch = 64; float best_efficiency = -1.0f;
-    vector<int> candidate_batches = {2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384};
+    vector<int> candidate_batches = {2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536};
     float* loss_gpu; int* correct_gpu; CHECK_CUDA(cudaMallocManaged(&loss_gpu, sizeof(float))); CHECK_CUDA(cudaMallocManaged(&correct_gpu, sizeof(int)));
-    int* batch_indices_gpu; CHECK_CUDA(cudaMallocManaged(&batch_indices_gpu, 16384 * sizeof(int)));
-    CudaVector batch_imgs(16384 * INPUT_DIM), hs(16384 * MAX_NEURONS), hs_norm(16384 * MAX_NEURONS), logits(16384 * NUM_CLASSES), dLogits(16384 * NUM_CLASSES), dL_dhs(16384 * MAX_NEURONS), dh_scaled(16384 * MAX_NEURONS);
+    int* batch_indices_gpu; CHECK_CUDA(cudaMallocManaged(&batch_indices_gpu, MAX_BENCH_BATCH * sizeof(int)));
+    CudaVector batch_imgs(MAX_BENCH_BATCH * INPUT_DIM), hs(MAX_BENCH_BATCH * MAX_NEURONS), hs_norm(MAX_BENCH_BATCH * MAX_NEURONS), logits(MAX_BENCH_BATCH * NUM_CLASSES), dLogits(MAX_BENCH_BATCH * NUM_CLASSES), dL_dhs(MAX_BENCH_BATCH * MAX_NEURONS), dh_scaled(MAX_BENCH_BATCH * MAX_NEURONS);
     CudaVector mu(MAX_NEURONS), var(MAX_NEURONS);
-    vector<uint8_t, CudaManagedAllocator<uint8_t>> batch_labels(16384);
+    vector<uint8_t, CudaManagedAllocator<uint8_t>> batch_labels(MAX_BENCH_BATCH);
 
     for(int b_size : candidate_batches) {
         auto b_start = chrono::high_resolution_clock::now();
-        for(int i=0; i<10; ++i) {
+        for(int i=0; i<5; ++i) {
             *loss_gpu = 0;
             for(int b=0; b<b_size; ++b) { batch_indices_gpu[b] = current_subset[gen() % current_subset.size()]; batch_labels[b] = all_labels[batch_indices_gpu[b]]; }
-            gather_images_kernel<<<b_size, 1024>>>(all_images.data(), batch_indices_gpu, batch_imgs.data(), b_size, INPUT_DIM);
+            gather_images_kernel<<<(b_size+255)/256, 256>>>(all_images.data(), batch_indices_gpu, batch_imgs.data(), b_size, INPUT_DIM);
             float alpha = 1.0f, beta = 0.0f;
             cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, H, b_size, INPUT_DIM, &alpha, W1.data(), MAX_NEURONS, batch_imgs.data(), INPUT_DIM, &beta, hs.data(), H);
             bn_lrelu_forward_kernel<<<(H+255)/256, 256>>>(hs.data(), hs_norm.data(), b1.data(), bn_gamma.data(), bn_beta.data(), mu.data(), var.data(), H, b_size);
@@ -206,7 +208,7 @@ int main() {
         }
         auto b_end = chrono::high_resolution_clock::now();
         double elapsed = chrono::duration<double>(b_end - b_start).count();
-        float efficiency = (b_size * 10.0f / elapsed);
+        float efficiency = (b_size * 5.0f / elapsed);
         cout << "[Bench] Batch: " << b_size << " | Efficiency: " << efficiency << " img/s" << endl;
         if(efficiency > best_efficiency) { best_efficiency = efficiency; best_batch = b_size; }
     }
@@ -224,7 +226,7 @@ int main() {
         cudaMemset(dW2.data(), 0, dW2.size()*4); cudaMemset(db2.data(), 0, NUM_CLASSES*4);
         cudaMemset(dG.data(), 0, MAX_NEURONS*4); cudaMemset(dB.data(), 0, MAX_NEURONS*4);
         for(int b=0; b<best_batch; ++b) { batch_indices_gpu[b] = current_subset[gen() % current_subset.size()]; batch_labels[b] = all_labels[batch_indices_gpu[b]]; }
-        gather_images_kernel<<<best_batch, 1024>>>(all_images.data(), batch_indices_gpu, batch_imgs.data(), best_batch, INPUT_DIM);
+        gather_images_kernel<<<(best_batch+255)/256, 256>>>(all_images.data(), batch_indices_gpu, batch_imgs.data(), best_batch, INPUT_DIM);
         float alpha = 1.0f, beta = 0.0f;
         CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, H, best_batch, INPUT_DIM, &alpha, W1.data(), MAX_NEURONS, batch_imgs.data(), INPUT_DIM, &beta, hs.data(), H));
         bn_lrelu_forward_kernel<<<(H+255)/256, 256>>>(hs.data(), hs_norm.data(), b1.data(), bn_gamma.data(), bn_beta.data(), mu.data(), var.data(), H, best_batch);
