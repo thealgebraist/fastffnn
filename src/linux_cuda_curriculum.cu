@@ -48,8 +48,16 @@ const int MAX_NEURONS = 8192;
 const int NUM_CLASSES = 10;
 const int TRAIN_LIMIT_S = 600; 
 const int INITIAL_NEURONS = 512;
-const int FULL_BATCH = 50000;
+const int MAX_SAMPLES = 50000;
 const float CLIP_THRESHOLD = 5.0f;
+
+__global__ void gather_images_kernel(const float* all_images, const int* batch_indices, float* batch_imgs, int B, int D) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b < B) {
+        int idx = batch_indices[b];
+        for(int d=0; d<D; ++d) { batch_imgs[b * D + d] = all_images[idx * D + d]; }
+    }
+}
 
 __global__ void centralize_grad_kernel(float* g, int rows, int cols) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -177,7 +185,7 @@ bool load_cifar(const string& path, CudaVector& images, vector<uint8_t, CudaMana
 }
 
 int main() {
-    cout << "H200 Multi-Phase Optimization: 512 Neurons -> 90% Threshold -> Nesterov+GC Refinement" << endl;
+    cout << "Monte Carlo Stochastic Training (H200)..." << endl;
     download_cifar10();
     CudaVector all_images; vector<uint8_t, CudaManagedAllocator<uint8_t>> all_labels;
     for(int i=1; i<=5; ++i) load_cifar("cifar-10-batches-bin/data_batch_" + to_string(i) + ".bin", all_images, all_labels);
@@ -193,33 +201,46 @@ int main() {
 
     cublasHandle_t handle; CHECK_CUBLAS(cublasCreate(&handle));
     float* loss_gpu; int* correct_gpu; CHECK_CUDA(cudaMallocManaged(&loss_gpu, sizeof(float))); CHECK_CUDA(cudaMallocManaged(&correct_gpu, sizeof(int)));
-    CudaVector hs(FULL_BATCH * MAX_NEURONS), hs_norm(FULL_BATCH * MAX_NEURONS), logits(FULL_BATCH * NUM_CLASSES), dLogits(FULL_BATCH * NUM_CLASSES), dL_dhs(FULL_BATCH * MAX_NEURONS), dh_scaled(FULL_BATCH * MAX_NEURONS);
+    int* batch_indices_gpu; CHECK_CUDA(cudaMallocManaged(&batch_indices_gpu, MAX_SAMPLES * sizeof(int)));
+    CudaVector hs(MAX_SAMPLES * MAX_NEURONS), hs_norm(MAX_SAMPLES * MAX_NEURONS), logits(MAX_SAMPLES * NUM_CLASSES), dLogits(MAX_SAMPLES * NUM_CLASSES), dL_dhs(MAX_SAMPLES * MAX_NEURONS), dh_scaled(MAX_SAMPLES * MAX_NEURONS), batch_imgs(MAX_SAMPLES * INPUT_DIM);
     CudaVector mu(MAX_NEURONS), var(MAX_NEURONS);
 
     auto start_time = chrono::high_resolution_clock::now();
-    int last_s = -1; bool refined_phase = false;
+    int last_s = -1, last_full_check = -20; bool refined_phase = false;
     float lr = 0.001f, last_loss = 1e10; int stagnate_count = 0, t = 0;
     CudaVector dW1(MAX_NEURONS * INPUT_DIM), db1(MAX_NEURONS), dW2(NUM_CLASSES * MAX_NEURONS), db2(NUM_CLASSES), dG(MAX_NEURONS), dB(MAX_NEURONS);
 
+    normal_distribution<float> dist_batch(4096, 2048);
+    normal_distribution<float> dist_train(8192, 4096);
+
     while (chrono::duration_cast<chrono::seconds>(chrono::high_resolution_clock::now() - start_time).count() < TRAIN_LIMIT_S) {
+        int n_train = max(1024, (int)dist_train(gen)); n_train = min(MAX_SAMPLES, n_train);
+        int b_size = max(128, (int)dist_batch(gen)); b_size = min(n_train, b_size);
+
         *loss_gpu = 0; *correct_gpu = 0;
         cudaMemset(dW1.data(), 0, dW1.size()*4); cudaMemset(db1.data(), 0, MAX_NEURONS*4);
         cudaMemset(dW2.data(), 0, dW2.size()*4); cudaMemset(db2.data(), 0, NUM_CLASSES*4);
         cudaMemset(dG.data(), 0, MAX_NEURONS*4); cudaMemset(dB.data(), 0, MAX_NEURONS*4);
         
+        for(int b=0; b<b_size; ++b) { batch_indices_gpu[b] = gen() % MAX_SAMPLES; }
+        gather_images_kernel<<<(b_size+255)/256, 256>>>(all_images.data(), batch_indices_gpu, batch_imgs.data(), b_size, INPUT_DIM);
+
         float alpha = 1.0f, beta = 0.0f;
-        CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, H, FULL_BATCH, INPUT_DIM, &alpha, W1.data(), MAX_NEURONS, all_images.data(), INPUT_DIM, &beta, hs.data(), H));
-        bn_lrelu_forward_kernel<<<(H+255)/256, 256>>>(hs.data(), hs_norm.data(), b1.data(), bn_gamma.data(), bn_beta.data(), mu.data(), var.data(), H, FULL_BATCH);
-        CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, NUM_CLASSES, FULL_BATCH, H, &alpha, W2.data(), NUM_CLASSES, hs.data(), H, &beta, logits.data(), NUM_CLASSES));
-        softmax_loss_kernel<<<(FULL_BATCH+255)/256, 256>>>(logits.data(), b2.data(), all_labels.data(), dLogits.data(), loss_gpu, correct_gpu, FULL_BATCH, NUM_CLASSES);
+        CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, H, b_size, INPUT_DIM, &alpha, W1.data(), MAX_NEURONS, batch_imgs.data(), INPUT_DIM, &beta, hs.data(), H));
+        bn_lrelu_forward_kernel<<<(H+255)/256, 256>>>(hs.data(), hs_norm.data(), b1.data(), bn_gamma.data(), bn_beta.data(), mu.data(), var.data(), H, b_size);
+        CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, NUM_CLASSES, b_size, H, &alpha, W2.data(), NUM_CLASSES, hs.data(), H, &beta, logits.data(), NUM_CLASSES));
+        
+        vector<uint8_t, CudaManagedAllocator<uint8_t>> batch_labels(b_size);
+        for(int b=0; b<b_size; ++b) batch_labels[b] = all_labels[batch_indices_gpu[b]];
+        softmax_loss_kernel<<<(b_size+255)/256, 256>>>(logits.data(), b2.data(), batch_labels.data(), dLogits.data(), loss_gpu, correct_gpu, b_size, NUM_CLASSES);
         cudaDeviceSynchronize();
         
-        CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, NUM_CLASSES, H, FULL_BATCH, &alpha, dLogits.data(), NUM_CLASSES, hs.data(), H, &beta, dW2.data(), NUM_CLASSES));
-        CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, H, FULL_BATCH, NUM_CLASSES, &alpha, W2.data(), NUM_CLASSES, dLogits.data(), NUM_CLASSES, &beta, dL_dhs.data(), H));
-        bn_backprop_kernel<<<(H+255)/256, 256>>>(dL_dhs.data(), hs_norm.data(), bn_gamma.data(), bn_beta.data(), var.data(), db1.data(), dG.data(), dB.data(), dh_scaled.data(), H, FULL_BATCH);
-        CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, H, INPUT_DIM, FULL_BATCH, &alpha, dh_scaled.data(), H, all_images.data(), INPUT_DIM, &beta, dW1.data(), MAX_NEURONS));
+        CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, NUM_CLASSES, H, b_size, &alpha, dLogits.data(), NUM_CLASSES, hs.data(), H, &beta, dW2.data(), NUM_CLASSES));
+        CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, H, b_size, NUM_CLASSES, &alpha, W2.data(), NUM_CLASSES, dLogits.data(), NUM_CLASSES, &beta, dL_dhs.data(), H));
+        bn_backprop_kernel<<<(H+255)/256, 256>>>(dL_dhs.data(), hs_norm.data(), bn_gamma.data(), bn_beta.data(), var.data(), db1.data(), dG.data(), dB.data(), dh_scaled.data(), H, b_size);
+        CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, H, INPUT_DIM, b_size, &alpha, dh_scaled.data(), H, batch_imgs.data(), INPUT_DIM, &beta, dW1.data(), MAX_NEURONS));
         
-        float inv_B = 1.0f / FULL_BATCH;
+        float inv_B = 1.0f / b_size;
         scale_vec_kernel<<<(dW1.size()+255)/256, 256>>>(dW1.data(), inv_B, dW1.size());
         scale_vec_kernel<<<(MAX_NEURONS+255)/256, 256>>>(db1.data(), inv_B, H);
         scale_vec_kernel<<<(dW2.size()+255)/256, 256>>>(dW2.data(), inv_B, dW2.size());
@@ -247,12 +268,9 @@ int main() {
             scale_vec_kernel<<<(MAX_NEURONS+255)/256, 256>>>(dB.data(), s, H);
         }
 
-        float avg_loss = *loss_gpu / FULL_BATCH; t++;
-        float acc = (*correct_gpu / (float)FULL_BATCH);
-        if (!refined_phase && acc >= 0.90f) {
-            refined_phase = true; lr *= 0.1f;
-            cout << ">>> 90% Accuracy Reached. Switching to Proper Solver (Nesterov + GC) <<<" << endl;
-        }
+        float avg_loss = *loss_gpu / b_size; t++;
+        float current_acc = (*correct_gpu / (float)b_size);
+        if (!refined_phase && current_acc >= 0.90f) { refined_phase = true; lr *= 0.1f; cout << ">>> 90% Reached. Nesterov+GC Active <<<" << endl; }
 
         if (refined_phase) {
             nesterov_kernel<<<(dW1.size()+255)/256, 256>>>(W1.data(), mW1.data(), dW1.data(), lr, 0.9f, H * INPUT_DIM);
@@ -273,9 +291,21 @@ int main() {
         cudaDeviceSynchronize();
         int current_s = chrono::duration_cast<chrono::seconds>(chrono::high_resolution_clock::now() - start_time).count();
         if (current_s > last_s) {
-            cout << "[Time: " << current_s << "s] Err: " << (1.0f - acc) * 100.0f << "% | Loss: " << avg_loss << " | Norm: " << total_norm << " | Neurons: " << H << (refined_phase ? " [REFINE]" : "") << endl;
+            cout << "[Time: " << current_s << "s] Iter: " << t << " | B: " << b_size << " | N_train: " << n_train << " | Loss: " << avg_loss << " | Neurons: " << H << endl;
             last_s = current_s;
         }
+
+        if (current_s % 20 == 0 && current_s > last_full_check) {
+            *loss_gpu = 0; *correct_gpu = 0;
+            CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, H, MAX_SAMPLES, INPUT_DIM, &alpha, W1.data(), MAX_NEURONS, all_images.data(), INPUT_DIM, &beta, hs.data(), H));
+            bn_lrelu_forward_kernel<<<(H+255)/256, 256>>>(hs.data(), hs_norm.data(), b1.data(), bn_gamma.data(), bn_beta.data(), mu.data(), var.data(), H, MAX_SAMPLES);
+            CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, NUM_CLASSES, MAX_SAMPLES, H, &alpha, W2.data(), NUM_CLASSES, hs.data(), H, &beta, logits.data(), NUM_CLASSES));
+            softmax_loss_kernel<<<(MAX_SAMPLES+255)/256, 256>>>(logits.data(), b2.data(), all_labels.data(), dLogits.data(), loss_gpu, correct_gpu, MAX_SAMPLES, NUM_CLASSES);
+            cudaDeviceSynchronize();
+            cout << ">>> [FULL DATASET CHECK] Err: " << (1.0f - (*correct_gpu / (float)MAX_SAMPLES)) * 100.0f << "% | Avg Loss: " << *loss_gpu / MAX_SAMPLES << " <<<" << endl;
+            last_full_check = current_s;
+        }
+
         if (abs(avg_loss - last_loss) < 1e-4) stagnate_count++; else stagnate_count = 0;
         last_loss = avg_loss;
         if (stagnate_count >= 4) { H += 2; stagnate_count = 0; }
