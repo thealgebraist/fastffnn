@@ -47,9 +47,28 @@ const int INPUT_DIM = 3072;
 const int MAX_NEURONS = 8192;
 const int NUM_CLASSES = 10;
 const int TRAIN_LIMIT_S = 600; 
-const int INITIAL_NEURONS = 1024;
+const int INITIAL_NEURONS = 512;
 const int FULL_BATCH = 50000;
 const float CLIP_THRESHOLD = 5.0f;
+
+__global__ void centralize_grad_kernel(float* g, int rows, int cols) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < rows) {
+        float sum = 0;
+        for(int j=0; j<cols; ++j) sum += g[i * cols + j];
+        float mean = sum / cols;
+        for(int j=0; j<cols; ++j) g[i * cols + j] -= mean;
+    }
+}
+
+__global__ void nesterov_kernel(float* w, float* v, const float* g, float lr, float mom, int size) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) {
+        float v_old = v[i];
+        v[i] = mom * v[i] - lr * g[i];
+        w[i] += -mom * v_old + (1.0f + mom) * v[i];
+    }
+}
 
 __global__ void fused_radam_kernel(float* w, float* m, float* v, const float* g, 
                                   float b1, float b2, float eps, float lr, 
@@ -158,7 +177,7 @@ bool load_cifar(const string& path, CudaVector& images, vector<uint8_t, CudaMana
 }
 
 int main() {
-    cout << "Full Batch Gradient Descent (50,000 images) H200 Optimized..." << endl;
+    cout << "H200 Multi-Phase Optimization: 512 Neurons -> 90% Threshold -> Nesterov+GC Refinement" << endl;
     download_cifar10();
     CudaVector all_images; vector<uint8_t, CudaManagedAllocator<uint8_t>> all_labels;
     for(int i=1; i<=5; ++i) load_cifar("cifar-10-batches-bin/data_batch_" + to_string(i) + ".bin", all_images, all_labels);
@@ -178,7 +197,7 @@ int main() {
     CudaVector mu(MAX_NEURONS), var(MAX_NEURONS);
 
     auto start_time = chrono::high_resolution_clock::now();
-    int last_s = -1;
+    int last_s = -1; bool refined_phase = false;
     float lr = 0.001f, last_loss = 1e10; int stagnate_count = 0, t = 0;
     CudaVector dW1(MAX_NEURONS * INPUT_DIM), db1(MAX_NEURONS), dW2(NUM_CLASSES * MAX_NEURONS), db2(NUM_CLASSES), dG(MAX_NEURONS), dB(MAX_NEURONS);
 
@@ -208,6 +227,11 @@ int main() {
         scale_vec_kernel<<<(MAX_NEURONS+255)/256, 256>>>(dG.data(), inv_B, H);
         scale_vec_kernel<<<(MAX_NEURONS+255)/256, 256>>>(dB.data(), inv_B, H);
 
+        if (refined_phase) {
+            centralize_grad_kernel<<<(H+255)/256, 256>>>(dW1.data(), H, INPUT_DIM);
+            centralize_grad_kernel<<<(NUM_CLASSES+255)/256, 256>>>(dW2.data(), NUM_CLASSES, H);
+        }
+
         float n1, n2, n3, n4, n5, n6;
         cublasSnrm2(handle, dW1.size(), dW1.data(), 1, &n1); cublasSnrm2(handle, H, db1.data(), 1, &n2);
         cublasSnrm2(handle, dW2.size(), dW2.data(), 1, &n3); cublasSnrm2(handle, NUM_CLASSES, db2.data(), 1, &n4);
@@ -224,16 +248,32 @@ int main() {
         }
 
         float avg_loss = *loss_gpu / FULL_BATCH; t++;
-        radam_call(W1.data(), mW1.data(), vW1.data(), dW1.data(), t, lr, H * INPUT_DIM);
-        radam_call(b1.data(), mb1.data(), vb1.data(), db1.data(), t, lr, H);
-        radam_call(W2.data(), mW2.data(), vW2.data(), dW2.data(), t, lr, NUM_CLASSES * MAX_NEURONS);
-        radam_call(b2.data(), mb2.data(), vb2.data(), db2.data(), t, lr, NUM_CLASSES);
-        radam_call(bn_gamma.data(), mG.data(), vG.data(), dG.data(), t, lr, H);
-        radam_call(bn_beta.data(), mB.data(), vB.data(), dB.data(), t, lr, H);
+        float acc = (*correct_gpu / (float)FULL_BATCH);
+        if (!refined_phase && acc >= 0.90f) {
+            refined_phase = true; lr *= 0.1f;
+            cout << ">>> 90% Accuracy Reached. Switching to Proper Solver (Nesterov + GC) <<<" << endl;
+        }
+
+        if (refined_phase) {
+            nesterov_kernel<<<(dW1.size()+255)/256, 256>>>(W1.data(), mW1.data(), dW1.data(), lr, 0.9f, H * INPUT_DIM);
+            nesterov_kernel<<<(MAX_NEURONS+255)/256, 256>>>(b1.data(), mb1.data(), db1.data(), lr, 0.9f, H);
+            nesterov_kernel<<<(dW2.size()+255)/256, 256>>>(W2.data(), mW2.data(), dW2.data(), lr, 0.9f, NUM_CLASSES * MAX_NEURONS);
+            nesterov_kernel<<<(NUM_CLASSES+255)/256, 256>>>(b2.data(), mb2.data(), db2.data(), lr, 0.9f, NUM_CLASSES);
+            nesterov_kernel<<<(MAX_NEURONS+255)/256, 256>>>(bn_gamma.data(), mG.data(), dG.data(), lr, 0.9f, H);
+            nesterov_kernel<<<(MAX_NEURONS+255)/256, 256>>>(bn_beta.data(), mB.data(), dB.data(), lr, 0.9f, H);
+        } else {
+            radam_call(W1.data(), mW1.data(), vW1.data(), dW1.data(), t, lr, H * INPUT_DIM);
+            radam_call(b1.data(), mb1.data(), vb1.data(), db1.data(), t, lr, H);
+            radam_call(W2.data(), mW2.data(), vW2.data(), dW2.data(), t, lr, NUM_CLASSES * MAX_NEURONS);
+            radam_call(b2.data(), mb2.data(), vb2.data(), db2.data(), t, lr, NUM_CLASSES);
+            radam_call(bn_gamma.data(), mG.data(), vG.data(), dG.data(), t, lr, H);
+            radam_call(bn_beta.data(), mB.data(), vB.data(), dB.data(), t, lr, H);
+        }
+        
         cudaDeviceSynchronize();
         int current_s = chrono::duration_cast<chrono::seconds>(chrono::high_resolution_clock::now() - start_time).count();
         if (current_s > last_s) {
-            cout << "[Time: " << current_s << "s] Err: " << (1.0f - (*correct_gpu / (float)FULL_BATCH)) * 100.0f << "% | Loss: " << avg_loss << " | Norm: " << total_norm << " | Neurons: " << H << endl;
+            cout << "[Time: " << current_s << "s] Err: " << (1.0f - acc) * 100.0f << "% | Loss: " << avg_loss << " | Norm: " << total_norm << " | Neurons: " << H << (refined_phase ? " [REFINE]" : "") << endl;
             last_s = current_s;
         }
         if (abs(avg_loss - last_loss) < 1e-4) stagnate_count++; else stagnate_count = 0;
