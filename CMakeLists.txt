@@ -7,4 +7,4 @@ set(CMAKE_CUDA_STANDARD 20)
 find_package(CUDAToolkit REQUIRED)
 
 add_executable(cuda_curriculum src/linux_cuda_curriculum.cu)
-target_link_libraries(cuda_curriculum PRIVATE CUDA::cublas)
+target_link_libraries(cuda_curriculum PRIVATE CUDA::cublas CUDA::cusolver)

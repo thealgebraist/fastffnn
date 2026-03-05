@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <numeric>
 #include <cublas_v2.h>
+#include <cusolverDn.h>
 #include <cuda_runtime.h>
 #include <sys/stat.h>
 #include <cstdlib>
@@ -25,6 +26,14 @@ using namespace std;
     cublasStatus_t status = call; \
     if(status != CUBLAS_STATUS_SUCCESS) { \
         cerr << "CUBLAS error at " << __FILE__ << ":" << __LINE__ << endl; \
+        exit(1); \
+    } \
+}
+
+#define CHECK_CUSOLVER(call) { \
+    cusolverStatus_t status = call; \
+    if(status != CUSOLVER_STATUS_SUCCESS) { \
+        cerr << "CUSOLVER error at " << __FILE__ << ":" << __LINE__ << endl; \
         exit(1); \
     } \
 }
@@ -54,16 +63,6 @@ const float CLIP_THRESHOLD = 5.0f;
 __global__ void add_eye_kernel(float* A, float lambda, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) A[i * n + i] += lambda;
-}
-
-__global__ void centralize_grad_kernel(float* g, int rows, int cols) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < rows) {
-        float sum = 0;
-        for(int j=0; j<cols; ++j) sum += g[i * cols + j];
-        float mean = sum / cols;
-        for(int j=0; j<cols; ++j) g[i * cols + j] -= mean;
-    }
 }
 
 __global__ void update_weights_kernel(float* w, const float* dw, float lr, int size) {
@@ -133,13 +132,23 @@ __global__ void scale_vec_kernel(float* v, float s, int size) {
     if (i < size) v[i] *= s;
 }
 
-void invert_matrix(cublasHandle_t handle, float* A, float* A_inv, int n, float lambda) {
+void invert_matrix_cusolver(cusolverDnHandle_t handle, float* A, float* A_inv, int n, float lambda) {
     add_eye_kernel<<<(n+255)/256, 256>>>(A, lambda, n);
-    int *info; cudaMallocManaged(&info, sizeof(int));
-    const float *A_ptr[1] = {A}; float *A_inv_ptr[1] = {A_inv};
-    CHECK_CUBLAS(cublasSmatinvBatched(handle, n, A_ptr, n, A_inv_ptr, n, info, 1));
+    int work_size = 0;
+    CHECK_CUSOLVER(cusolverDnSpotrf_bufferSize(handle, CUBLAS_FILL_MODE_LOWER, n, A, n, &work_size));
+    float* work; cudaMalloc(&work, work_size * sizeof(float));
+    int* info; cudaMallocManaged(&info, sizeof(int));
+    
+    // Identity for inverse
+    cudaMemset(A_inv, 0, n * n * sizeof(float));
+    for(int i=0; i<n; ++i) { float one = 1.0f; cudaMemcpy(A_inv + i*n + i, &one, sizeof(float), cudaMemcpyHostToDevice); }
+    
+    CHECK_CUSOLVER(cusolverDnSpotrf(handle, CUBLAS_FILL_MODE_LOWER, n, A, n, work, work_size, info));
     CHECK_CUDA(cudaDeviceSynchronize());
-    cudaFree(info);
+    CHECK_CUSOLVER(cusolverDnSpotrs(handle, CUBLAS_FILL_MODE_LOWER, n, n, A, n, A_inv, n, info));
+    CHECK_CUDA(cudaDeviceSynchronize());
+    
+    cudaFree(work); cudaFree(info);
 }
 
 void download_cifar10() {
@@ -160,7 +169,7 @@ bool load_cifar(const string& path, CudaVector& images, vector<uint8_t, CudaMana
 }
 
 int main() {
-    cout << "Pure Full-Batch K-FAC (Gauss-Newton) Solver (H200)..." << endl;
+    cout << "Pure Full-Batch K-FAC (Gauss-Newton) Solver with cuSOLVER (H200)..." << endl;
     download_cifar10();
     CudaVector all_images; vector<uint8_t, CudaManagedAllocator<uint8_t>> all_labels;
     for(int i=1; i<=5; ++i) load_cifar("cifar-10-batches-bin/data_batch_" + to_string(i) + ".bin", all_images, all_labels);
@@ -173,10 +182,11 @@ int main() {
     for(int i=0; i<NUM_CLASSES*MAX_NEURONS; ++i) W2[i] = d2(gen);
 
     cublasHandle_t handle; CHECK_CUBLAS(cublasCreate(&handle));
+    cusolverDnHandle_t solver_handle; CHECK_CUSOLVER(cusolverDnCreate(&solver_handle));
     float* loss_gpu; int* correct_gpu; CHECK_CUDA(cudaMallocManaged(&loss_gpu, sizeof(float))); CHECK_CUDA(cudaMallocManaged(&correct_gpu, sizeof(int)));
+    
     CudaVector hs(MAX_SAMPLES * MAX_NEURONS), hs_norm(MAX_SAMPLES * MAX_NEURONS), logits(MAX_SAMPLES * NUM_CLASSES), dLogits(MAX_SAMPLES * NUM_CLASSES), dL_dhs(MAX_SAMPLES * MAX_NEURONS), dh_scaled(MAX_SAMPLES * MAX_NEURONS);
     CudaVector mu(MAX_NEURONS), var(MAX_NEURONS);
-    
     CudaVector A1(INPUT_DIM * INPUT_DIM), G1(MAX_NEURONS * MAX_NEURONS), A2(MAX_NEURONS * MAX_NEURONS), G2(NUM_CLASSES * NUM_CLASSES);
     CudaVector A1_inv(INPUT_DIM * INPUT_DIM), G1_inv(MAX_NEURONS * MAX_NEURONS), A2_inv(MAX_NEURONS * MAX_NEURONS), G2_inv(NUM_CLASSES * NUM_CLASSES);
     CudaVector temp1(MAX_NEURONS * INPUT_DIM), temp2(NUM_CLASSES * MAX_NEURONS);
@@ -193,7 +203,6 @@ int main() {
         CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, H, MAX_SAMPLES, INPUT_DIM, &alpha, W1.data(), MAX_NEURONS, all_images.data(), INPUT_DIM, &beta, hs.data(), H));
         bn_lrelu_forward_kernel<<<(H+255)/256, 256>>>(hs.data(), hs_norm.data(), b1.data(), bn_gamma.data(), bn_beta.data(), mu.data(), var.data(), H, MAX_SAMPLES);
         CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, NUM_CLASSES, MAX_SAMPLES, H, &alpha, W2.data(), NUM_CLASSES, hs.data(), H, &beta, logits.data(), NUM_CLASSES));
-        
         softmax_loss_kernel<<<(MAX_SAMPLES+255)/256, 256>>>(logits.data(), b2.data(), all_labels.data(), dLogits.data(), loss_gpu, correct_gpu, MAX_SAMPLES, NUM_CLASSES);
         cudaDeviceSynchronize();
         
@@ -206,21 +215,19 @@ int main() {
         scale_vec_kernel<<<(dW1.size()+255)/256, 256>>>(dW1.data(), inv_B, dW1.size());
         scale_vec_kernel<<<(dW2.size()+255)/256, 256>>>(dW2.data(), inv_B, dW2.size());
 
-        // Pure K-FAC (Gauss-Newton) Step
         float gn_alpha = 1.0f / MAX_SAMPLES;
         CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, INPUT_DIM, INPUT_DIM, MAX_SAMPLES, &gn_alpha, all_images.data(), INPUT_DIM, all_images.data(), INPUT_DIM, &beta, A1.data(), INPUT_DIM));
         CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, H, H, MAX_SAMPLES, &gn_alpha, dh_scaled.data(), H, dh_scaled.data(), H, &beta, G1.data(), H));
         CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, H, H, MAX_SAMPLES, &gn_alpha, hs.data(), H, hs.data(), H, &beta, A2.data(), H));
         CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, NUM_CLASSES, NUM_CLASSES, MAX_SAMPLES, &gn_alpha, dLogits.data(), NUM_CLASSES, dLogits.data(), NUM_CLASSES, &beta, G2.data(), NUM_CLASSES));
         
-        invert_matrix(handle, A1.data(), A1_inv.data(), INPUT_DIM, 0.01f);
-        invert_matrix(handle, G1.data(), G1_inv.data(), H, 0.01f);
-        invert_matrix(handle, A2.data(), A2_inv.data(), H, 0.01f);
-        invert_matrix(handle, G2.data(), G2_inv.data(), NUM_CLASSES, 0.01f);
+        invert_matrix_cusolver(solver_handle, A1.data(), A1_inv.data(), INPUT_DIM, 0.01f);
+        invert_matrix_cusolver(solver_handle, G1.data(), G1_inv.data(), H, 0.01f);
+        invert_matrix_cusolver(solver_handle, A2.data(), A2_inv.data(), H, 0.01f);
+        invert_matrix_cusolver(solver_handle, G2.data(), G2_inv.data(), NUM_CLASSES, 0.01f);
 
         CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, H, INPUT_DIM, H, &alpha, G1_inv.data(), H, dW1.data(), MAX_NEURONS, &beta, temp1.data(), H));
         CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, H, INPUT_DIM, INPUT_DIM, &alpha, temp1.data(), H, A1_inv.data(), INPUT_DIM, &beta, dW1.data(), MAX_NEURONS));
-        
         CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, NUM_CLASSES, H, NUM_CLASSES, &alpha, G2_inv.data(), NUM_CLASSES, dW2.data(), NUM_CLASSES, &beta, temp2.data(), NUM_CLASSES));
         CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, NUM_CLASSES, H, H, &alpha, temp2.data(), NUM_CLASSES, A2_inv.data(), H, &beta, dW2.data(), NUM_CLASSES));
         
@@ -235,5 +242,5 @@ int main() {
             last_s = current_s;
         }
     }
-    cublasDestroy(handle); return 0;
+    cublasDestroy(handle); cusolverDnDestroy(solver_handle); return 0;
 }
