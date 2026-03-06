@@ -14,3 +14,6 @@ target_link_libraries(sa_solver PRIVATE CUDA::cublas CUDA::curand)
 
 add_executable(mphc_solver src/mphc_solver.cu)
 target_link_libraries(mphc_solver PRIVATE CUDA::cublas CUDA::curand)
+
+add_executable(row_kfac_solver src/row_kfac_solver.cu)
+target_link_libraries(row_kfac_solver PRIVATE CUDA::cublas CUDA::cusolver)
