@@ -38,10 +38,25 @@ using namespace std;
 }
 
 const int INPUT_DIM = 3072;
-const int HIDDEN_DIM = 1024; // Increased for better spectral resolution
+const int HIDDEN_DIM = 1024;
 const int NUM_CLASSES = 10;
-const int BATCH_SIZE = 50000; // Full 50k batch
+const int BATCH_SIZE = 50000;
 const int TRAIN_LIMIT_S = 600;
+
+__global__ void copy_to_complex_kernel(cufftComplex* complex_h, const float* real_h, int size) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) {
+        complex_h[i].x = real_h[i];
+        complex_h[i].y = 0.0f;
+    }
+}
+
+__global__ void copy_from_complex_kernel(float* real_h, const cufftComplex* complex_h, int size, float scale) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) {
+        real_h[i] = complex_h[i].x * scale;
+    }
+}
 
 __global__ void spectral_ode_step_kernel(cufftComplex* freq, const float2* filter, int size) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -82,7 +97,7 @@ __global__ void softmax_loss_kernel(const float* logits, const uint8_t* labels, 
 
 __global__ void update_weights_kernel(float* W, const float* grad, float lr, int size) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < size) W[i] -= lr * grad;
+    if (i < size) W[i] -= lr * grad[i];
 }
 
 void download_cifar10() {
@@ -120,7 +135,7 @@ int main() {
     CHECK_CUDA(cudaMalloc(&W2, NUM_CLASSES * HIDDEN_DIM * sizeof(float)));
     
     mt19937 gen(42);
-    normal_distribution<float> d1(0, sqrt(2.0/INPUT_DIM)), d2(0, sqrt(2.0/HIDDEN_DIM));
+    normal_distribution<float> d1(0, sqrtf(2.0f/INPUT_DIM)), d2(0, sqrtf(2.0f/HIDDEN_DIM));
     vector<float> h_W1(HIDDEN_DIM * INPUT_DIM), h_W2(NUM_CLASSES * HIDDEN_DIM);
     for(float& w : h_W1) w = d1(gen);
     for(float& w : h_W2) w = d2(gen);
@@ -151,34 +166,24 @@ int main() {
     int iter = 0;
 
     while (chrono::duration_cast<chrono::seconds>(chrono::high_resolution_clock::now() - start_time).count() < TRAIN_LIMIT_S) {
-        // 1. Linear Mapping: h = W1 * X
         float alpha = 1.0f, beta = 0.0f;
         CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, HIDDEN_DIM, BATCH_SIZE, INPUT_DIM, &alpha, W1, HIDDEN_DIM, d_X, INPUT_DIM, &beta, d_h, HIDDEN_DIM));
 
-        // 2. Prepare for Spectral ODE: Convert Real to Complex
-        // Using a simple copy-to-complex kernel for brevity
-        CHECK_CUDA(cudaMemset(d_h_complex, 0, BATCH_SIZE * HIDDEN_DIM * sizeof(cufftComplex)));
-        // (In a production code, use a real-to-complex FFT for 2x speed, here using C2C for implementation simplicity)
-        // ... (kernel to copy d_h to d_h_complex.x)
-
-        // 3. Spectral ODE Step in Fourier Domain
+        copy_to_complex_kernel<<<(BATCH_SIZE * HIDDEN_DIM + 255) / 256, 256>>>(d_h_complex, d_h, BATCH_SIZE * HIDDEN_DIM);
+        
         CHECK_CUFFT(cufftExecC2C(fft_plan, d_h_complex, d_h_complex, CUFFT_FORWARD));
         spectral_ode_step_kernel<<<(BATCH_SIZE * HIDDEN_DIM + 255) / 256, 256>>>(d_h_complex, d_filter, BATCH_SIZE * HIDDEN_DIM);
-        CHECK_CUFFT(cufftExecC2C(fft_plan, d_h_complex, d_h_complex, CUFFT_BACKWARD));
+        CHECK_CUFFT(cufftExecC2C(fft_plan, d_h_complex, d_h_complex, CUFFT_INVERSE));
 
-        // 4. Back to Real Space + LReLU
-        // ... (kernel to copy d_h_complex.x back to d_h and normalize by 1/HIDDEN_DIM)
+        copy_from_complex_kernel<<<(BATCH_SIZE * HIDDEN_DIM + 255) / 256, 256>>>(d_h, d_h_complex, BATCH_SIZE * HIDDEN_DIM, 1.0f / HIDDEN_DIM);
         lrelu_kernel<<<(BATCH_SIZE * HIDDEN_DIM + 255) / 256, 256>>>(d_h, BATCH_SIZE * HIDDEN_DIM);
 
-        // 5. Output Layer: logits = W2 * h
         CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, NUM_CLASSES, BATCH_SIZE, HIDDEN_DIM, &alpha, W2, NUM_CLASSES, d_h, HIDDEN_DIM, &beta, d_logits, NUM_CLASSES));
 
-        // 6. Loss & Gradient
         *loss_gpu = 0; *correct_gpu = 0;
         softmax_loss_kernel<<<(BATCH_SIZE + 255) / 256, 256>>>(d_logits, d_labels, d_dLogits, loss_gpu, correct_gpu, BATCH_SIZE, NUM_CLASSES);
         CHECK_CUDA(cudaDeviceSynchronize());
 
-        // 7. Refine W2 with GD
         float g_alpha = 1.0f / BATCH_SIZE;
         CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, NUM_CLASSES, HIDDEN_DIM, BATCH_SIZE, &g_alpha, d_dLogits, NUM_CLASSES, d_h, HIDDEN_DIM, &beta, d_dW2, NUM_CLASSES));
         update_weights_kernel<<<(NUM_CLASSES * HIDDEN_DIM + 255) / 256, 256>>>(W2, d_dW2, lr, NUM_CLASSES * HIDDEN_DIM);
