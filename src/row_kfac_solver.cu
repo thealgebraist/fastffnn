@@ -103,17 +103,22 @@ __global__ void get_neuron_grad_kernel(const float* dLogits, const float* W2, co
     int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b < B) {
         float dl_dact = 0;
-        for(int c=0; c<C; ++c) dl_dact += dLogits[b * C + c] * W2[c * H + target_row];
+        for(int c=0; c<C; ++c) dl_dact += dLogits[b * C + c] * W2[c + target_row * C]; // W2 is CxH, col-major
         float act = hs_norm[b * H + target_row] * gamma[target_row];
         da_i[b] = (dl_dact * (act > 0 ? 1.0f : 0.1f)) / var[target_row];
     }
 }
 
-__global__ void update_row_kernel(float* W1_row, const float* dw_i, float lr, int target_row, int D) {
+__global__ void update_row_kernel(float* W1, const float* dw_i, float lr, int target_row, int H, int D) {
     int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j < D) {
-        W1_row[target_row * D + j] -= lr * dw_i[j];
+        W1[target_row + j * H] -= lr * dw_i[j];
     }
+}
+
+__global__ void update_w2_kernel(float* W2, const float* dW2, float lr, int size) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) W2[i] -= lr * dW2[i];
 }
 
 void invert_matrix_cusolver(cusolverDnHandle_t handle, float* A, float* A_inv, int n, float lambda) {
@@ -149,7 +154,7 @@ bool load_cifar(const string& path, CudaVector& images, vector<uint8_t, CudaMana
 }
 
 int main() {
-    cout << "Single-Neuron Row K-FAC Solver (H200)..." << endl;
+    cout << "Corrected Single-Neuron Row K-FAC Solver (H200)..." << endl;
     download_cifar10();
     CudaVector all_images; vector<uint8_t, CudaManagedAllocator<uint8_t>> all_labels;
     for(int i=1; i<=5; ++i) load_cifar("cifar-10-batches-bin/data_batch_" + to_string(i) + ".bin", all_images, all_labels);
@@ -165,23 +170,20 @@ int main() {
     cusolverDnHandle_t solver_handle; CHECK_CUSOLVER(cusolverDnCreate(&solver_handle));
     float* loss_gpu; int* correct_gpu; CHECK_CUDA(cudaMallocManaged(&loss_gpu, sizeof(float))); CHECK_CUDA(cudaMallocManaged(&correct_gpu, sizeof(int)));
     
-    CudaVector hs(BATCH_SIZE * H), hs_norm(BATCH_SIZE * H), logits(BATCH_SIZE * NUM_CLASSES), dLogits(BATCH_SIZE * NUM_CLASSES);
+    CudaVector hs(BATCH_SIZE * H), hs_norm(BATCH_SIZE * H), logits(BATCH_SIZE * NUM_CLASSES), dLogits(BATCH_SIZE * NUM_CLASSES), dW2(NUM_CLASSES * H);
     CudaVector mu(H), var(H), da_i(BATCH_SIZE), row_grad(INPUT_DIM), row_natural_grad(INPUT_DIM);
     CudaVector A(INPUT_DIM * INPUT_DIM), A_inv(INPUT_DIM * INPUT_DIM);
 
-    // Initial A inversion (entire dataset covariance)
-    cout << "Computing and inverting global input covariance A..." << endl;
+    cout << "Computing global input covariance A..." << endl;
     float alpha = 1.0f / BATCH_SIZE, beta = 0.0f;
     CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, INPUT_DIM, INPUT_DIM, BATCH_SIZE, &alpha, all_images.data(), INPUT_DIM, all_images.data(), INPUT_DIM, &beta, A.data(), INPUT_DIM));
     invert_matrix_cusolver(solver_handle, A.data(), A_inv.data(), INPUT_DIM, 0.01f);
 
     auto start_time = chrono::high_resolution_clock::now();
-    int last_s = -1; float lr = 0.1f; int t = 0;
+    int last_s = -1; float lr = 0.05f; int t = 0;
 
     while (chrono::duration_cast<chrono::seconds>(chrono::high_resolution_clock::now() - start_time).count() < TRAIN_LIMIT_S) {
         *loss_gpu = 0; *correct_gpu = 0;
-        
-        // Forward
         float f_alpha = 1.0f, f_beta = 0.0f;
         CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, H, BATCH_SIZE, INPUT_DIM, &f_alpha, W1.data(), H, all_images.data(), INPUT_DIM, &f_beta, hs.data(), H));
         bn_lrelu_forward_kernel<<<(H+255)/256, 256>>>(hs.data(), hs_norm.data(), b1.data(), bn_gamma.data(), bn_beta.data(), mu.data(), var.data(), H, BATCH_SIZE);
@@ -189,26 +191,22 @@ int main() {
         softmax_loss_kernel<<<(BATCH_SIZE+255)/256, 256>>>(logits.data(), b2.data(), all_labels.data(), dLogits.data(), loss_gpu, correct_gpu, BATCH_SIZE, NUM_CLASSES);
         cudaDeviceSynchronize();
 
-        // 1. Pick a random neuron row
-        int target_row = gen() % H;
+        // 1. Full-Batch update for W2 (Output Layer) via SGD
+        float w2_alpha = 1.0f / BATCH_SIZE;
+        CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, NUM_CLASSES, H, BATCH_SIZE, &w2_alpha, dLogits.data(), NUM_CLASSES, hs.data(), H, &beta, dW2.data(), NUM_CLASSES));
+        update_w2_kernel<<<(NUM_CLASSES * H + 255)/256, 256>>>(W2.data(), dW2.data(), lr, NUM_CLASSES * H);
 
-        // 2. Get local pre-activation gradients for that neuron
+        // 2. K-FAC update for a SINGLE random neuron row in W1
+        int target_row = gen() % H;
         get_neuron_grad_kernel<<<(BATCH_SIZE+255)/256, 256>>>(dLogits.data(), W2.data(), hs_norm.data(), bn_gamma.data(), var.data(), da_i.data(), target_row, H, BATCH_SIZE, NUM_CLASSES);
-        
-        // 3. Compute row gradient: g_i = mean(da_i * X)
         CHECK_CUBLAS(cublasSgemv(handle, CUBLAS_OP_N, INPUT_DIM, BATCH_SIZE, &alpha, all_images.data(), INPUT_DIM, da_i.data(), 1, &f_beta, row_grad.data(), 1));
         
-        // 4. Compute Fisher scalar s_i = mean(da_i^2)
-        float s_i;
-        CHECK_CUBLAS(cublasSnrm2(handle, BATCH_SIZE, da_i.data(), 1, &s_i));
-        s_i = (s_i * s_i) / BATCH_SIZE + 1e-6f;
+        float s_i; CHECK_CUBLAS(cublasSnrm2(handle, BATCH_SIZE, da_i.data(), 1, &s_i));
+        s_i = (s_i * s_i) / BATCH_SIZE + 1e-4f; // Damped Fisher scalar
 
-        // 5. Precondition: dw_i = row_grad * A_inv / s_i
         float inv_si = 1.0f / s_i;
         CHECK_CUBLAS(cublasSgemv(handle, CUBLAS_OP_N, INPUT_DIM, INPUT_DIM, &inv_si, A_inv.data(), INPUT_DIM, row_grad.data(), 1, &f_beta, row_natural_grad.data(), 1));
-
-        // 6. Update targeted row
-        update_row_kernel<<<(INPUT_DIM+255)/256, 256>>>(W1.data(), row_natural_grad.data(), lr, target_row, INPUT_DIM);
+        update_row_kernel<<<(INPUT_DIM+255)/256, 256>>>(W1.data(), row_natural_grad.data(), lr, target_row, H, INPUT_DIM);
 
         t++; cudaDeviceSynchronize();
         int current_s = chrono::duration_cast<chrono::seconds>(chrono::high_resolution_clock::now() - start_time).count();
