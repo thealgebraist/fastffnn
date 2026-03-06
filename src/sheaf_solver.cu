@@ -84,6 +84,15 @@ __global__ void softmax_loss_kernel(const float* logits, const uint8_t* labels, 
     }
 }
 
+__global__ void clip_gradients_kernel(float* grad, float clip_val, int size) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) {
+        float g = grad[i];
+        if (g > clip_val) grad[i] = clip_val;
+        else if (g < -clip_val) grad[i] = -clip_val;
+    }
+}
+
 __global__ void update_weights_kernel(float* W, const float* grad, float lr, int size) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < size) W[i] -= lr * grad[i];
@@ -156,8 +165,9 @@ int main() {
     CHECK_CUDA(cudaMallocManaged(&correct_gpu, sizeof(int)));
 
     auto start_time = chrono::high_resolution_clock::now();
-    float lr = 0.05f; 
-    float alpha = 0.1f; // Diffusion step size
+    float lr = 0.005f; 
+    float alpha = 0.05f; // Reduced diffusion step size
+    float clip_val = 1.0f;
     int iter = 0;
 
     int num_blocks_B_H = (BATCH_SIZE * HIDDEN_DIM + 255) / 256;
@@ -221,6 +231,10 @@ int main() {
         CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, HIDDEN_DIM, INPUT_DIM, BATCH_SIZE, &invB, d_dH0, HIDDEN_DIM, d_X, INPUT_DIM, &zero, d_dW_in, HIDDEN_DIM));
 
         // UPDATE WEIGHTS
+        clip_gradients_kernel<<<(NUM_CLASSES * HIDDEN_DIM + 255)/256, 256>>>(d_dW_out, clip_val, NUM_CLASSES * HIDDEN_DIM);
+        clip_gradients_kernel<<<num_blocks_H_H, 256>>>(d_dL_base, clip_val, HIDDEN_DIM * HIDDEN_DIM);
+        clip_gradients_kernel<<<(HIDDEN_DIM * INPUT_DIM + 255)/256, 256>>>(d_dW_in, clip_val, HIDDEN_DIM * INPUT_DIM);
+
         update_weights_kernel<<<(NUM_CLASSES * HIDDEN_DIM + 255)/256, 256>>>(W_out, d_dW_out, lr, NUM_CLASSES * HIDDEN_DIM);
         update_weights_kernel<<<num_blocks_H_H, 256>>>(L_base, d_dL_base, lr, HIDDEN_DIM * HIDDEN_DIM);
         update_weights_kernel<<<(HIDDEN_DIM * INPUT_DIM + 255)/256, 256>>>(W_in, d_dW_in, lr, HIDDEN_DIM * INPUT_DIM);
