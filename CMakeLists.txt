@@ -20,3 +20,6 @@ target_link_libraries(row_kfac_solver PRIVATE CUDA::cublas CUDA::cusolver)
 
 add_executable(full_radam_solver src/full_radam_solver.cu)
 target_link_libraries(full_radam_solver PRIVATE CUDA::cublas)
+
+add_executable(spectral_gaussian src/spectral_gaussian.cu)
+target_link_libraries(spectral_gaussian PRIVATE CUDA::cublas CUDA::cufft)
