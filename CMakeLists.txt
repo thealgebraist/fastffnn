@@ -26,3 +26,6 @@ target_link_libraries(spectral_gaussian PRIVATE CUDA::cublas CUDA::cufft)
 
 add_executable(spectral_gd_solver src/spectral_gd_solver.cu)
 target_link_libraries(spectral_gd_solver PRIVATE CUDA::cublas CUDA::cufft)
+
+add_executable(sheaf_solver src/sheaf_solver.cu)
+target_link_libraries(sheaf_solver PRIVATE CUDA::cublas)
